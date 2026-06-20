@@ -29,8 +29,35 @@ final class ModelRouter {
     let nameB: String?
     private let mem: RouterMemory
 
+    // The large model the user can opt into: a single higher-quality ~1.2GB model served
+    // straight (no race), for machines with the RAM. Lives at Models/typer-1l.gguf and is
+    // fetched on demand (ModelDownloader). HF source for that download:
+    static let largeModelFile = "typer-1l.gguf"
+    static let largeModelURL = "https://huggingface.co/milosa/typer-1-v1/resolve/main/typer1-f16.gguf"
+    static var modelsDir: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/typer/Models")
+    }
+    static var largeModelPath: String { modelsDir.appendingPathComponent(largeModelFile).path }
+    static func largeModelInstalled() -> Bool { FileManager.default.fileExists(atPath: largeModelPath) }
+
+    // True for this router instance when it's serving the large model (single model, no race).
+    let isLarge: Bool
+
     init(cfg: TyperConfig) {
         self.cfg = cfg
+        // Large variant: serve the single big model directly, no A/B race — but only if the
+        // user picked it AND it's actually downloaded; otherwise fall back to the small race.
+        if cfg.modelVariant == "large", ModelRouter.largeModelInstalled() {
+            isLarge = true
+            nameA = ModelRouter.largeModelFile
+            clientA = LlamaClient(cfg: cfg, modelPath: ModelRouter.largeModelPath)
+            nameB = nil
+            clientB = nil
+            mem = RouterMemory(cfg: cfg)
+            return
+        }
+        isLarge = false
         let (a, b) = ModelRouter.resolveModels(cfg)
         nameA = a.map { ($0 as NSString).lastPathComponent } ?? "unknown"
         clientA = LlamaClient(cfg: cfg, modelPath: a)
@@ -113,6 +140,9 @@ final class ModelRouter {
 
     // Wipe the race state (share + reward windows + any lock) — also called by "Reset All Data".
     func reset() { mem.reset() }
+
+    // Kill both arms' helper processes — called before swapping the router on a model switch.
+    func shutdown() { clientA.stop(); clientB?.stop() }
 
     // Synchronously persist race state — called on app terminate so a winner locked
     // in the last debounce window isn't lost on quit.

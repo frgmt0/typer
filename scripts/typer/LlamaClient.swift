@@ -136,4 +136,11 @@ final class LlamaClient {
     // Lock-safe warm-up so the launch-time start() can't double-spawn against the
     // first real request().
     func warmUp() { lock.lock(); defer { lock.unlock() }; try? start() }
+
+    // Kill the helper process (used when switching models — the next client spawns fresh).
+    func stop() {
+        lock.lock(); defer { lock.unlock() }
+        process?.terminate()
+        process = nil; input = nil; output = nil
+    }
 }

@@ -20,6 +20,7 @@ final class TyperApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                         // it activated Typer) — for the "Disable in <app>" row
     var updateInProgress = false        // a "Check for updates" run is mid-flight (guards re-entry)
     lazy var menuModel: MenuModel = { let m = MenuModel(); m.app = self; return m }()
+    var onboarding: OnboardingController?     // first-launch onboarding window, while shown
     let overlay = SuggestionOverlay()
     var observerTap: CFMachPort?        // listen-only: never gates input delivery
     var acceptTap: CFMachPort?          // consuming: enabled only while a suggestion shows
@@ -155,6 +156,8 @@ final class TyperApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             log("requested Screen Recording access (for screen capture)")
         }
         setupMenu()
+        // First launch: walk the user through permissions + model choice before anything else.
+        if !cfg.onboardingComplete { showOnboarding() }
         setupEventTap()
         updateAXObserver()
         startTopicTimer()

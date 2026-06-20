@@ -114,6 +114,9 @@ extension TyperApp {
         if let repo = Bundle.main.object(forInfoDictionaryKey: "TyperRepoPath") as? String, !repo.isEmpty {
             s.canUpdate = FileManager.default.fileExists(atPath: repo + "/update.sh")
         }
+
+        s.modelVariant = effectiveVariant()
+        s.largeInstalled = ModelRouter.largeModelInstalled()
         return s
     }
 

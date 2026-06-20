@@ -68,7 +68,15 @@ struct TyperConfig {
     // just serves the single model. `typer1RatchetStep` is the per-adjust share move and
     // `typer1RatchetMinSamples` the per-arm samples + cooldown before each move.
     var typer1Enabled = true
-    var typer1ModelGlob = "typer-1"     // filename prefix marking the racing models
+    var typer1ModelGlob = "typer-1-"    // filename prefix marking the small racing models
+                                        // (trailing "-" so the large "typer-1l.gguf" is excluded)
+
+    // Model size the user has chosen. "small" = the on-device 0.6B (typer-1, the race above);
+    // "large" = the higher-quality ~1.2GB model (typer-1l.gguf), for machines with RAM to spare.
+    // Large is served as a single model (no race). Switched live from the menu / onboarding.
+    var modelVariant = "small"          // "small" | "large"
+    // First-launch onboarding (permissions + model choice + intro) is shown until completed.
+    var onboardingComplete = false
     var typer1RatchetStep = 0.05        // share moved toward the leading model per adjust
     var typer1RatchetMinSamples = 40    // per-arm resolutions + cooldown before each adjust
     // Legacy single-candidate-rollout knobs, still parsed for old configs but unused by the
@@ -116,6 +124,8 @@ struct TyperConfig {
             case "disable_in_terminals": cfg.disableInTerminals = value == "true"
             case "typer1_enabled": cfg.typer1Enabled = value == "true"
             case "typer1_model_glob": cfg.typer1ModelGlob = value
+            case "model_variant": cfg.modelVariant = (value == "large") ? "large" : "small"
+            case "onboarding_complete": cfg.onboardingComplete = value == "true"
             case "typer1_share_start": cfg.typer1ShareStart = Double(value) ?? cfg.typer1ShareStart
             case "typer1_share_min": cfg.typer1ShareMin = Double(value) ?? cfg.typer1ShareMin
             case "typer1_share_max": cfg.typer1ShareMax = Double(value) ?? cfg.typer1ShareMax

@@ -55,6 +55,9 @@ struct MenuSnapshot {
 
     var version = ""              // short git commit this build was made from ("" if unknown)
     var canUpdate = false         // true only for source builds that know their checkout path
+
+    var modelVariant = "small"    // "small" | "large" — the size currently being served
+    var largeInstalled = false    // whether typer-1l.gguf is already downloaded
 }
 
 enum MenuAction {
@@ -73,20 +76,22 @@ final class MenuModel: ObservableObject {
     func toggleApp() { app?.setToggle(key: "enabled", on: !snap.enabled); refresh() }
     func toggleCurrentApp() { app?.performMenuAction(.disableCurrentApp); refresh() }
     func action(_ a: MenuAction) { app?.performMenuAction(a); refresh() }
+    func setModel(_ variant: String) { app?.setModelVariant(variant); refresh() }
 }
 
 // MARK: - Root
 
 struct MenuRootView: View {
     @ObservedObject var model: MenuModel
+    @ObservedObject var downloader = ModelDownloader.shared
     private var s: MenuSnapshot { model.snap }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             divider
-            if s.racing { modelCard.padding(.bottom, 4); divider }
-            else if !s.singleModel.isEmpty { caption("Model", s.singleModel); divider }
+            modelSection
+            divider
             stats
             divider
             SwitchRow(title: "Completions", isOn: model.bind("completion_enabled", \.completionEnabled))
@@ -130,6 +135,39 @@ struct MenuRootView: View {
         }
         .frame(height: 24)
         .padding(.horizontal, kInset).padding(.top, 2)
+    }
+
+    // MARK: model size + preference
+
+    // The Small/Large picker, on-demand download progress, and (for Small) the live A/B race bar.
+    private var modelSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Model").font(.system(size: 11)).foregroundStyle(.secondary)
+                Spacer()
+                ModelSizePicker(variant: s.modelVariant, downloading: downloader.isDownloading) { model.setModel($0) }
+            }.padding(.horizontal, kInset)
+
+            if case let .downloading(frac) = downloader.state {
+                VStack(alignment: .leading, spacing: 4) {
+                    ProgressView(value: frac >= 0 ? frac : nil, total: 1)
+                        .progressViewStyle(.linear).tint(.accentColor)
+                    Text(frac >= 0 ? "Downloading typer-1l… \(Int(frac * 100))%" : "Downloading typer-1l…")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                }.padding(.horizontal, kInset)
+            } else if case let .failed(msg) = downloader.state {
+                Text("Download failed — \(msg)").font(.system(size: 10)).foregroundStyle(.red)
+                    .padding(.horizontal, kInset)
+            } else if s.modelVariant == "large" {
+                Text("Large model active · best on 16 GB+ of RAM")
+                    .font(.system(size: 10)).foregroundStyle(.secondary).padding(.horizontal, kInset)
+            }
+
+            // Small variant: surface the live raw-vs-distill race when two arms are running.
+            if s.modelVariant == "small" {
+                if s.racing { modelCard } else if !s.singleModel.isEmpty { caption("Model", s.singleModel) }
+            }
+        }
     }
 
     // MARK: model preference
@@ -296,6 +334,33 @@ private struct IconButton: View {
                 .background(RoundedRectangle(cornerRadius: 5).fill(Color.primary.opacity(hover ? 0.1 : 0)))
         }
         .buttonStyle(.plain).help(help).onHover { hover = $0 }
+    }
+}
+
+// Two-segment Small/Large model-size selector. Disabled while a download is in flight.
+private struct ModelSizePicker: View {
+    let variant: String
+    let downloading: Bool
+    let onPick: (String) -> Void
+    var body: some View {
+        HStack(spacing: 0) {
+            seg("Small", "small")
+            seg("Large", "large")
+        }
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.08)))
+        .opacity(downloading ? 0.5 : 1)
+    }
+    private func seg(_ label: String, _ v: String) -> some View {
+        let active = variant == v
+        return Button(action: { if !downloading { onPick(v) } }) {
+            Text(label).font(.system(size: 11, weight: .medium))
+                .frame(width: 46, height: 20)
+                .foregroundStyle(active ? Color.white : Color.secondary)
+                .background(RoundedRectangle(cornerRadius: 6).fill(active ? Color.accentColor : Color.clear))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(downloading)
     }
 }
 
