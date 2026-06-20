@@ -57,7 +57,7 @@ class Server:
         self.proc = subprocess.Popen(
             [str(server), "--model-path", str(model)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            bufsize=1, text=True,
+            bufsize=1, text=True, encoding="utf-8", errors="replace",
         )
 
     def request(self, context: str, max_words: int, timeout: float = 15.0, mode: str | None = None):
