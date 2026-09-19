@@ -11,8 +11,14 @@ extension TyperApp {
     // Rendered width of `s` at the current ghost font (used to advance the overlay
     // as the user types through a suggestion without re-reading the caret).
     func ghostWidth(_ s: String) -> CGFloat {
-        let fs = min(max(lastCaretHeight * 0.62, 11), 30)
-        let measured = (s as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: fs)]).width
+        // Measure in the font the overlay ACTUALLY renders with (the caret fix's font,
+        // already clamped against the line height). Measuring in a system font while
+        // drawing in the host's was a systematic type-through/Tab advance drift that the
+        // widthScale EMA then had to absorb; the EMA now only carries the residual.
+        let font = lastCaretFix?.font ?? NSFont.systemFont(
+            ofSize: CaretGeometry.ghostFontSizing(axFontPointSize: nil, axFontHeight: nil,
+                                                  lineHeight: lastCaretHeight, adjustment: 1).size)
+        let measured = (s as NSString).size(withAttributes: [.font: font]).width
         // Bias slightly forward. The host app may use a wider font than our ghost
         // renderer; being a few pixels ahead is far less distracting than sitting on
         // top of the word the user is actively typing, and the delayed AX re-anchor
@@ -31,8 +37,14 @@ extension TyperApp {
     func advanceGhost(by s: String) {
         guard let p = lastCaretPoint else { return }
         let raw = ghostWidth(s)
-        lastCaretPoint = NSPoint(x: p.x + raw * widthScale(), y: p.y)
+        let moved = NSPoint(x: p.x + raw * widthScale(), y: p.y)
+        lastCaretPoint = moved
+        lastCaretFix?.pointAppKit = moved
         calibPredicted += raw
+        // Spend the extrapolation budget: past 40 chars / a line change since the last
+        // real fix, the cached point is fiction and the ghost hides instead of drifting.
+        charsSinceCaretFix += s.count
+        lineChangesSinceCaretFix += s.reduce(0) { $1 == "\n" || $1 == "\r" ? $0 + 1 : $0 }
     }
 
     // Compare how far the caret ACTUALLY moved since the last authoritative fix
@@ -106,66 +118,37 @@ extension TyperApp {
     }
 
     // Personalized lexicon for the sampler (#10, Wave 4). Gated by the existing
-    // `cfg.lexiconEnabled` feature flag, then routed through the router's single
-    // personalization seam (`PersonalizationBias`), which scales BOTH the lexicon string AND
-    // the `[token:Float]` logit-bias map by `cfg.personalizationStrength`. Strength 0 — the
-    // default — yields an empty list (personalization off, no regression); higher strength
-    // sends more of the user's frequent words and a deeper per-token bias. The router reads the
-    // strength here (not its init-time cfg copy), so a slider change takes effect on the very
-    // next generation, and re-derives only when the strength bucket or word list changes.
+    // `cfg.lexiconEnabled` feature flag AND by `cfg.personalizationStrength`, then routed
+    // through the router's single personalization seam (`PersonalizationBias`), which scales
+    // the word list by the strength. The router reads the strength here (not its init-time cfg
+    // copy), so a slider change takes effect on the very next generation, and re-derives only
+    // when the strength bucket or word list changes.
+    //
+    // Strength 0 means OFF, and now actually is: an empty list and no bias on the wire. It used
+    // to mean "48 words at the historical 0.5 boost" — the comment claimed otherwise, and the
+    // slider's own zero position therefore still shipped the full lexicon.
     func personalizedLexicon() -> String {
-        guard cfg.lexiconEnabled else { return "" }
-        installBiasTokenizerIfNeeded()
+        guard cfg.lexiconEnabled, cfg.personalizationStrength > 0 else { return "" }
         // Pull a generous candidate pool (the router trims to the strength-scaled count); the
         // 60s-cached topWords keeps this off the disk on the hot path.
         let pool = lexicon.topWords(64)
         return router.lexiconString(words: pool, strength: cfg.personalizationStrength)
     }
 
-    // Per-word logit-bias weight for the lexicon, scaled by the personalization slider so the
-    // control is actually felt: 0.5 (the gentle historical baseline) at strength 0, rising to
-    // ~2.5 at full strength where suggestions lean hard toward your own words. nil ⇒ helper
-    // default (0.5), keeping the wire byte-identical when personalization is off.
+    // Per-word logit-bias weight for the lexicon. The slider scales HOW MANY of the user's
+    // words are sent (and how much style sample rides along); it does NOT scale how hard each
+    // one is pushed. That ceiling is fixed at the evaluated +0.5 "gentle tie-break" — the value
+    // the helper defaults to, the value `PersonalizationBias.maxBoost` documents, and the value
+    // docs/autocomplete-model.md calls "the runtime +0.5 first-token boost".
+    //
+    // It used to be `0.5 + strength * 2.0`, i.e. +1.2 logits at the shipped strength of 0.35 and
+    // +2.5 at the top of the slider. Under the helper's greedy decoding that is not a tie-break:
+    // a boost that size simply overrides the model's own ranking, so any of the ~50 words in the
+    // list beats whatever the model actually predicted. nil ⇒ helper default, which keeps the
+    // wire byte-identical when personalization is off.
     func personalizedLexiconBias() -> Float? {
         guard cfg.lexiconEnabled, cfg.personalizationStrength > 0 else { return nil }
-        return Float(0.5 + cfg.personalizationStrength * 2.0)
-    }
-
-    // The `[token:Float]` logit-bias map for this generation (spec §G.3 interim). Built from the
-    // same strength-scaled word pool as `personalizedLexicon()`. Empty when personalization is
-    // off (strength 0 / flag off) or until the helper token-id accessor is wired. Passed to the
-    // sampler via the request path's bias seam.
-    func personalizationBiasMap() -> [Int32: Float] {
-        guard cfg.lexiconEnabled, cfg.personalizationStrength > 0 else { return [:] }
-        installBiasTokenizerIfNeeded()
-        let pool = lexicon.topWords(64)
-        return router.personalizationBias(words: pool, strength: cfg.personalizationStrength)
-    }
-
-    // Wire the router's bias-map builder to the helper tokenizer ONCE. The closure asks the
-    // current default arm for a word's token ids via the helper's tokenize endpoint (`ids:1`)
-    // and returns the FIRST — the word-start token the helper biases. Lazy + idempotent so it
-    // costs nothing until personalization is actually used.
-    //
-    // DEPENDENCY (LlamaClient owner — W1B/W2B): `LlamaClient.tokenCount` already round-trips the
-    // tokenize endpoint but decodes only `n_tokens`; the endpoint also returns the id list when
-    // `ids:1` is set. Exposing `func tokenIDs(_ block: String) -> [Int32]` there (decode the
-    // `tokens` array) lets this closure return real ids and the `[token:Float]` map populates.
-    // Until then `tokenIDs(_:)` is absent, so this closure returns [] and the bias MAP stays
-    // empty — but the strength-scaled lexicon STRING path (the live mechanism) is fully wired.
-    private func installBiasTokenizerIfNeeded() {
-        router.setBiasTokenizer { [weak self] word in
-            self?.leadingTokenIDs(of: word) ?? []
-        }
-    }
-
-    // Leading token id(s) of `word` from the active helper. Returns [] when no token-id accessor
-    // is available on the client yet (see the DEPENDENCY note above); the bias-string channel is
-    // unaffected. Kept as a single indirection point so wiring the real accessor is one edit.
-    private func leadingTokenIDs(of word: String) -> [Int32] {
-        // No public token-id accessor on LlamaClient yet; the bias map is empty until one lands.
-        // The strength-scaled lexicon string still reaches the sampler via request(lexicon:).
-        return []
+        return PersonalizationBias.maxBoost
     }
 
     // A suggestion was just shown: remember the context it continued so the eventual
@@ -192,7 +175,7 @@ extension TyperApp {
         let takenWords = String(chars[0..<n]).split(whereSeparator: { $0.isWhitespace }).count
         let shownWords = p.suggestion.split(whereSeparator: { $0.isWhitespace }).count
         trainingLog.record(TrainingLog.Record(
-            schema_version: 2, ts: Date().timeIntervalSince1970,
+            schema_version: TrainingLog.schemaVersion, ts: Date().timeIntervalSince1970,
             context: p.context, suggestion: p.suggestion,
             accepted: takenWords > 0, accept_kind: takenWords > 0 ? acceptKind : "none",
             words_accepted: takenWords, words_shown: shownWords,
@@ -212,7 +195,7 @@ extension TyperApp {
         guard ctx.count >= cfg.minContextChars, canCaptureTraining(context: ctx, suggestion: suggestion) else { return }
         let shownWords = s.split(whereSeparator: { $0.isWhitespace }).count
         trainingLog.record(TrainingLog.Record(
-            schema_version: 2, ts: Date().timeIntervalSince1970,
+            schema_version: TrainingLog.schemaVersion, ts: Date().timeIntervalSince1970,
             context: ctx, suggestion: suggestion,
             accepted: false, accept_kind: "none", words_accepted: 0, words_shown: shownWords,
             confidence: conf, shown: false, exploration: true, min_conf: effectiveMinConfidence,
@@ -236,8 +219,14 @@ extension TyperApp {
     func showCompletionRemainder(reanchor: Bool = true, animate: Bool = false, trustAX: Bool = false) {
         guard let comp = completion, !comp.done else { overlay.orderOut(nil); return }
         let guardPoint = (comp.consumed > 0 && !trustAX) ? lastCaretPoint : nil
-        let point = reanchor ? currentCaretPoint(allowBackwardFrom: guardPoint) : (lastCaretPoint ?? currentCaretPoint())
-        overlay.showCompletion(comp.remainder, at: point, lineHeight: lastCaretHeight, animate: animate)
+        let fix = reanchor
+            ? resolveCaret(allowBackwardFrom: guardPoint)
+            : (cachedCaretFix() ?? resolveCaret(allowBackwardFrom: guardPoint))
+        // nil == we do not know where the caret is. Hide the ghost, but KEEP `completion`:
+        // the suggestion is still valid and reappears the moment a fix lands (a failed
+        // placement must never throw away a good suggestion).
+        guard let fix else { overlay.orderOut(nil); return }
+        overlay.showCompletion(comp.remainder, at: fix, animate: animate)
     }
 
     // Our tap callback runs BEFORE the host app applies the keystroke, so reading the
@@ -263,10 +252,9 @@ extension TyperApp {
         // fires after a real pause.
         let settle = DispatchWorkItem { [weak self] in
             guard let self, self.completion != nil else { return }
-            if let ax = self.caretPoint() {
-                self.calibrateGhostWidth(authoritative: ax)
-                self.shotCaretPoint = nil
-                self.lastCaretPoint = ax
+            if let fix = self.resolveCaret(), fix.isAuthoritative {
+                // Only a validated AX rect may teach the width model.
+                self.calibrateGhostWidth(authoritative: fix.pointAppKit)
                 self.showCompletionRemainder(reanchor: false)
             } else {
                 self.showCompletionRemainder(reanchor: true, trustAX: true)
@@ -284,7 +272,12 @@ extension TyperApp {
         let piece = String(comp.chars[comp.consumed..<end])
         lastUserTypedAt = Date()
         insert(piece)
-        appendToBuffer(piece)
+        // The MODEL wrote this, not the user. Marked unlearnable so it never becomes
+        // "their vocabulary" or "their voice": learning it back would close the loop —
+        // the word enters the lexicon, the lexicon gives it a logit boost, the model
+        // emits it more often, and typer ends up personalizing to itself.
+        unlearnableSource = .model
+        appendToBuffer(piece, learnable: false)
         comp.consumed = end
         stats.accepted += 1; recordCompleted(piece); statsTouched()
         if comp.done {
@@ -313,7 +306,8 @@ extension TyperApp {
         let piece = comp.remainder
         lastUserTypedAt = Date()
         insert(piece)
-        appendToBuffer(piece)
+        unlearnableSource = .model      // typer's own text; never learned back (see acceptCompletionWord)
+        appendToBuffer(piece, learnable: false)
         stats.accepted += 1; recordCompleted(piece); statsTouched()
         armAcceptGrace()
         var resolved = comp; resolved.consumed = resolved.chars.count
@@ -362,11 +356,23 @@ extension TyperApp {
     // If a prefetched chunk matches the current buffer state, show it instantly.
     func promotePrefetch() -> Bool {
         guard let pf = prefetched, prefetchKey == stableTail(buffer, max: 500) else { return false }
+        // A promoted prefetch is shown without ever passing through presentCompletion, so
+        // it has to clear the same two bars: no disallowed scalars, and not the text the
+        // user already turned down for this context.
+        let text = String(pf.chars)
+        let tail = InputSanitizer.contextTail(prefetchTrainImmediate)
+        guard TextSanitizer.isClean(text),
+              !InputSanitizer.isRepeatOfRejected(lastRejected, contextTail: tail, suggestion: text) else {
+            prefetched = nil; prefetchKey = ""
+            return false
+        }
         completion = pf
         prefetched = nil
         prefetchKey = ""
         stats.shown += 1; statsTouched()   // a promoted prefetch is a shown suggestion
-        noteTraining(context: prefetchTrainImmediate, suggestion: String(pf.chars), conf: prefetchTrainConf, source: "prefetch")
+        lastPresentedTail = tail
+        lastPresentedAt = Date()
+        noteTraining(context: prefetchTrainImmediate, suggestion: text, conf: prefetchTrainConf, source: "prefetch")
         showCompletionRemainder(animate: true)
         calibAnchor = lastCaretPoint; calibPredicted = 0   // fresh calibration epoch
         log("promoted prefetch")
@@ -386,8 +392,30 @@ extension TyperApp {
         }
     }
 
+    // An AXSelectedTextChanged that arrived while a generation was in flight or a debounce
+    // was armed is deliberately not acted on there (at that moment the change is almost
+    // always our own), but it used to be dropped on the floor, so a genuine external edit
+    // landing inside that window was never re-synced at all. It is parked instead, and
+    // drained here — at the two moments the window closes: the debounce firing, and the
+    // request returning. Returns true when it fired, so the caller stops what it was doing.
+    @discardableResult
+    func drainExternalSelectionChange() -> Bool {
+        guard pendingExternalSelectionChange else { return false }
+        pendingExternalSelectionChange = false
+        let now = Date()
+        // Typing (or one of our own injections) since means the parked notification was
+        // ours after all — the whole reason the guard exists.
+        guard now.timeIntervalSince(lastUserTypedAt) > TyperApp.axSelfChangeWindow,
+              now.timeIntervalSince(lastSyntheticAt) > TyperApp.axSelfChangeWindow else { return false }
+        dismissForExternalEdit(reason: "AXSelectedTextChanged (deferred)")
+        return true
+    }
+
     func generate() {
         syncActiveApp()
+        // A real external caret move was parked while this debounce was armed: honour it
+        // instead of completing from a buffer we now know is wrong.
+        if drainExternalSelectionChange() { return }
         // Never complete into our own UI (Settings/onboarding text fields): reading the
         // focused element / caret of a SwiftUI window AX-walks its a11y tree on the main
         // thread and beachballs. (Same reason as refreshBackgroundIfNeeded/updateAXObserver.)
@@ -417,9 +445,25 @@ extension TyperApp {
         // Both context sources go through stableTail (not a sliding suffix) so the
         // prompt prefix stays byte-identical across keystrokes and the helper's KV
         // prefix cache actually hits. textAroundCursor applies it internally.
-        let axCtx = textAroundCursor(limit: 500)
+        // AX text is the single place invisible formatting gets in: an app's AXValue can
+        // carry a byte-order mark or a bidi mark that nobody typed and nobody can see.
+        // Strip it HERE, at the one point AX text enters the completion path, so it never
+        // reaches the prompt, the training log or the buffer. (The grammar path in
+        // handleTyping deliberately keeps the raw value — its UTF-16 offsets have to line
+        // up with the app's own text.)
+        let axCtx = textAroundCursor(limit: 500).map {
+            AXContext(before: TextSanitizer.strippingInvisibles($0.before),
+                      after: TextSanitizer.strippingInvisibles($0.after))
+        }
         let axContextRaw = axCtx?.before
-        let keyContext = stableTail(buffer, max: 500)
+        // While a caret re-sync is pending the buffer still describes text at the OLD caret
+        // position, and everything typed since the caret moved has been appended to the end
+        // of it — so using it whole would hand the model stale text glued to text typed
+        // somewhere else entirely. `typedSinceNav` is exactly the part that is still known
+        // to sit in front of the caret; it is usually too short to clear `minContextChars`,
+        // which is the correct outcome (say nothing rather than guess) until the re-sync
+        // lands a few hundred milliseconds later and restores the full buffer.
+        let keyContext = stableTail(navResyncPending ? typedSinceNav : buffer, max: 500)
         let axContext = (axContextRaw?.count ?? 0) >= max(cfg.minContextChars, min(20, keyContext.count / 2)) ? axContextRaw : nil
         let contextSource = axContext == nil ? "key-buffer" : "AXValue"
         let context = axContext ?? keyContext
@@ -452,7 +496,12 @@ extension TyperApp {
         }
         // Remember the text right after the caret so we can drop completions that
         // just repeat it (e.g. at end of a line that already has following text).
-        lastTrailing = (axContext != nil ? (axCtx?.after ?? "") : "").trimmingCharacters(in: .whitespacesAndNewlines)
+        // Taken from AX whenever AX gave us anything at all — NOT only when AX also won
+        // the contest for the prompt context. In an app whose AXValue is too short to beat
+        // the keystroke buffer (exactly the AX-hostile fields where a completion is most
+        // likely to duplicate what is already there) this used to be left empty, so the
+        // echo-drop below simply never ran.
+        lastTrailing = (axCtx?.after ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard context.count >= cfg.minContextChars else { log("[\(activeAppKey)] generate skipped context=\(context.count) source=\(contextSource)"); return }
         let trimmed = context.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.hasSuffix("?") { log("[\(activeAppKey)] generate skipped question"); clearSuggestion(); return }
@@ -496,7 +545,14 @@ extension TyperApp {
                     // Don't paint a stream the final gate would tear down — flashing
                     // and yanking a bad suggestion is worse than a moment of silence.
                     if let conf, conf < self.effectiveMinConfidence { return }
+                    guard TextSanitizer.isClean(partial) else { return }
                     self.completion = ActiveCompletion(chars: Array(partial))
+                    // A painted partial IS a presented suggestion: Esc on it records a
+                    // rejection against `lastPresentedTail`, and the AX observer's guard
+                    // asks when a completion was last put on screen. Leaving both unset
+                    // here stored the rejection under an empty (never-matching) context.
+                    self.lastPresentedTail = InputSanitizer.contextTail(context)
+                    self.lastPresentedAt = Date()
                     self.showCompletionRemainder(reanchor: firstPartial, animate: firstPartial)
                     if firstPartial { self.calibAnchor = self.lastCaretPoint; self.calibPredicted = 0 }
                     firstPartial = false
@@ -507,8 +563,18 @@ extension TyperApp {
                 self.requestInFlight = false
                 let again = self.rerequestNeeded
                 self.rerequestNeeded = false
+                // An external caret move parked while this request was in the helper: act
+                // on it now, and do NOT present a completion built for the old position
+                // (nor re-request from the buffer it came from — the re-sync will).
+                if self.drainExternalSelectionChange() { return }
                 if appKey == self.activeAppKey, self.generationSerial == serial {
-                    self.presentCompletion((sug ?? nil)?.text, conf: (sug ?? nil)?.conf, requestedBuffer: reqBuffer)
+                    // `context` is what actually went to the model (AX text when it won,
+                    // the keystroke buffer otherwise); `reqBuffer` is only the yardstick for
+                    // "what did the user type since the request". The training log wants the
+                    // former — it used to be handed the latter, so every row generated from
+                    // AX text was stored paired with a context the model never saw.
+                    self.presentCompletion((sug ?? nil)?.text, conf: (sug ?? nil)?.conf,
+                                           requestedBuffer: reqBuffer, context: context)
                 }
                 // Always converge on the latest context.
                 if again { self.scheduleGenerate() }
@@ -519,7 +585,7 @@ extension TyperApp {
     // Show a freshly generated completion, tolerating that the user may have typed
     // MORE since the request was issued: if they typed along the prediction we show
     // the remaining tail; if they diverged we regenerate.
-    func presentCompletion(_ text: String?, conf: Double? = nil, requestedBuffer: String) {
+    func presentCompletion(_ text: String?, conf: Double? = nil, requestedBuffer: String, context: String) {
         guard let text, !text.isEmpty else {
             // No usable result for this generation (empty, or gated/percentage-suppressed
             // at the final stage). A streamed partial of THIS generation may already be
@@ -531,12 +597,32 @@ extension TyperApp {
             overlay.orderOut(nil)
             return
         }
+        let tail = InputSanitizer.contextTail(context)
+        // Scalar gate, first of all: a suggestion carrying a control character, a
+        // private-use glyph or a U+FFFD is not a completion, it is the model echoing
+        // something broken out of its own context. Never show it, never log it.
+        guard TextSanitizer.isClean(text) else {
+            log("drop completion with disallowed scalars")
+            completion = nil
+            overlay.orderOut(nil)
+            return
+        }
+        // The one suggestion we KNOW is unwanted: the exact text the user just dismissed
+        // with Esc, or typed straight past, for this exact context. Decoding is greedy, so
+        // regenerating from an unchanged context reproduces it character for character and
+        // it would pop back up the moment the debounce fired again.
+        if InputSanitizer.isRepeatOfRejected(lastRejected, contextTail: tail, suggestion: text) {
+            log("drop completion already rejected for this context")
+            completion = nil
+            overlay.orderOut(nil)
+            return
+        }
         // The confidence gate: when the model was mostly guessing, show nothing.
         // (A streamed partial of this generation may already be painted — take it
         // down rather than leave a known-low-quality suggestion up.)
         if let conf, conf < effectiveMinConfidence {
             dlog("[\(activeAppKey)] suppressed low-confidence completion conf=\(String(format: "%.2f", conf)) bar=\(String(format: "%.2f", effectiveMinConfidence))")
-            noteSuppressed(context: requestedBuffer, suggestion: text, conf: conf)
+            noteSuppressed(context: context, suggestion: text, conf: conf)
             completion = nil
             overlay.orderOut(nil)
             return
@@ -574,7 +660,9 @@ extension TyperApp {
             scheduleGenerate(); return         // typed off the prediction
         }
         stats.shown += 1; statsTouched()
-        noteTraining(context: requestedBuffer, suggestion: text, conf: conf, source: "generate")
+        lastPresentedTail = tail
+        lastPresentedAt = Date()
+        noteTraining(context: context, suggestion: text, conf: conf, source: "generate")
         showCompletionRemainder(animate: true)
         calibAnchor = lastCaretPoint; calibPredicted = 0   // fresh calibration epoch
         maybePrefetch()

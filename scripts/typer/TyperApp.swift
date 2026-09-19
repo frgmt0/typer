@@ -40,16 +40,19 @@ final class TyperApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // out of the keystroke-consuming path the rest of the time.
     var active: Correction? { didSet { refreshAcceptTap() } }            // typo/grammar diff
     var completion: ActiveCompletion? { didSet { refreshAcceptTap() } } // inline completion
-    var lastCaretPoint: NSPoint?
+    // The last caret probe's whole answer (point, line height, font, colour, screen,
+    // element frame, tier). Downstream code reads THIS instead of re-reading AX — see
+    // TyperApp+Caret. nil means "we do not know where the caret is": the ghost hides.
+    var lastCaretFix: CaretFix?
+    var lastCaretFixAt = Date.distantPast
+    // How far the ghost has been optimistically extrapolated since that fix. Past the
+    // budget (CaretGeometry.maxExtrapolation*) the cached point is a guess and we hide.
+    var charsSinceCaretFix = 0
+    var lineChangesSinceCaretFix = 0
+    var lastCaretPoint: NSPoint?        // fix.pointAppKit, forward-shifted by advanceGhost
     var lastCaretHeight: CGFloat = 18   // caret line height, to match the app's font
     var reanchorWork: DispatchWorkItem? // deferred AX caret re-anchor after a keystroke
     var settleWork: DispatchWorkItem?   // late authoritative re-anchor (corrects drift)
-    var caretHeightFloor: CGFloat?      // smallest caret height seen this focus session
-    // Which caret-geometry API the frontmost app actually answers (AXTextMarker for
-    // WebKit/Chromium, AXBoundsForRange for native AppKit). Remembered per bundle so
-    // every caret read doesn't pay failing IPC round-trips probing the wrong one.
-    enum CaretPath { case marker, bounds }
-    var caretPathByBundle: [String: CaretPath] = [:]
     // Screenshot-based caret cache for apps without AX caret geometry. We compute it
     // occasionally (it is slow) and extrapolate horizontally as the user types.
     var shotCaretPoint: NSPoint?
@@ -122,6 +125,62 @@ final class TyperApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // How far into each app's buffer the lexicon has already learned, so repeated
     // flushes (app switches, clicks) never double-count the same typed words.
     var lexiconWatermark: [String: Int] = [:]
+    // The same watermark for the STYLE memory. It had none: `recordLearning` re-recorded
+    // runs over the whole buffer every time it was called — on every Return, every app
+    // switch, every click and every caret resync — so one paragraph was offered to
+    // style.txt dozens of times and only StyleMemory's eight-line dedupe window stopped it.
+    var styleWatermark: [String: Int] = [:]
+    // Stretches of each app's buffer the user did NOT write: text typer inserted on an
+    // accept, and characters produced by a held key. `recordLearning` subtracts them
+    // before anything reaches the lexicon or the style memory — without this, accepting
+    // a suggestion taught the model its own output back as the user's vocabulary, and
+    // those words then got a logit boost on every later generation.
+    var unlearnableSpans: [String: [UnlearnableSpan]] = [:]
+    // Which flavour of "not the user's writing" the next `learnable: false` append is.
+    // Set immediately before the call rather than threaded through appendToBuffer's
+    // signature: the two producers (an accept, an auto-repeat keystroke) are single
+    // statements, and every other caller wants the default.
+    var unlearnableSource: UnlearnableSpan.Source = .model
+    // Debounced "the caret moved without typing" re-sync. A held ← fires dozens of
+    // keyDowns; they must collapse into ONE AX read after the key settles.
+    static let caretResyncDebounce: TimeInterval = 0.15
+    // How recently one of OUR events (a real keystroke, or our own injected accept) must
+    // have happened for an AXSelectedTextChanged to be attributable to it rather than to
+    // something moving the caret behind our back.
+    static let axSelfChangeWindow: TimeInterval = 0.15
+    // …and how recently a completion must have been PAINTED for an AXSelectedTextChanged to
+    // be attributable to that paint. Longer than the keystroke window because the chain it
+    // covers is longer: the keystroke that started the generation, the request, and the
+    // host's own notification for the edit, which some apps post only once they have
+    // finished laying the line out again.
+    static let axPresentedWindow: TimeInterval = 0.4
+    var caretResyncScheduled = false
+    var caretResyncLastAt = Date.distantPast
+    // When we last saw one of our OWN injected events come back through the observer tap.
+    // The AXSelectedTextChanged handler uses it to tell "the app applied typer's accept"
+    // from "something moved the caret behind our back".
+    var lastSyntheticAt = Date.distantPast
+    // The suggestion the user last turned down (Esc, or typing straight past it) and the
+    // context tail it was shown for. Greedy decoding regenerates an identical suggestion
+    // from an identical context, so without this the rejected text pops right back up.
+    var lastRejected: InputSanitizer.RejectedSuggestion?
+    var lastPresentedTail = ""          // context tail the on-screen suggestion was generated for
+    var lastPresentedAt = Date.distantPast   // when a completion was last painted on screen
+    // Text appended to the buffer since the caret last moved somewhere we cannot model (an
+    // arrow key, a chord, a click, an external AX selection change). It is contiguous,
+    // known-good text immediately before the caret, which makes it the ONLY part of the
+    // buffer that is still trustworthy in that window — and the buffer we can fall back to
+    // when the resync's AX read comes back empty-handed.
+    var typedSinceNav = ""
+    // A buffer re-sync is pending (debounced, or in its deferred read): until it lands the
+    // buffer still describes text at the OLD caret position, so only `typedSinceNav` may be
+    // used as prompt context. This is what keeps stale text from being glued to text typed
+    // somewhere else entirely.
+    var navResyncPending = false
+    // An AXSelectedTextChanged we could not act on because a generation was mid-flight.
+    // Dropped on the floor before: a genuine external edit arriving inside the request
+    // window was never re-synced at all.
+    var pendingExternalSelectionChange = false
     // Ghost width calibration: ratio of the host app's real text advance to our
     // SF-font estimate, learned per bundle from settled AX caret reads. 1.0 until
     // measured; this is what keeps the ghost from sitting on the word being typed
@@ -176,6 +235,15 @@ final class TyperApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         log("Typer launch cfg enabled=\(cfg.enabled) completion=\(cfg.completionEnabled) typo=\(cfg.typoEnabled) debounce=\(cfg.debounceMs) debugLog=\(cfg.debugLogging)")
         activeAppKey = currentAppKey()
         log("initial app=\(activeAppKey)")
+        // One-shot repair of the stores written before the input gate existed (control
+        // characters in style.txt / training.jsonl / lexicon.json, and a feedback/router
+        // verdict built from arrow keys counted as rejections). Runs HERE because nothing
+        // above it reads a store: `cfg` comes from config.toml, `stats` from stats.json
+        // (neither is migrated), and StyleMemory / PersonalLexicon / TopicMemory /
+        // TrainingLog / FeedbackMemory all load lazily on first use — which, for the
+        // router's own state, is inside the `ModelRouter(cfg:)` on the next line.
+        StoreMigration.runIfNeeded(directory: FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/typer")) { log($0) }
         router = ModelRouter(cfg: cfg)
         routedModelName = router.defaultName
         promptAccessibility()
@@ -263,18 +331,55 @@ final class TyperApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // voice + vocabulary lexicon). Called wherever a writing session "ends": Return,
     // app switch, click elsewhere.
     func recordLearning() {
-        if cfg.styleMemoryEnabled { styleMemory.record(buffer, category: appCategory()) }
-        if cfg.lexiconEnabled { learnLexiconDelta() }
+        let chars = Array(buffer)
+        // Every span must still sit exactly where it claims. nil means the buffer was
+        // rewritten by a path that does not keep this bookkeeping (a typo correction
+        // swapping a word, a hand reset), so we can no longer tell the user's words from
+        // the model's — and the safe answer there is to learn nothing at all.
+        let spans = LearnableSpans.verified(unlearnableSpans[activeAppKey] ?? [], in: chars)
+        if cfg.styleMemoryEnabled { learnStyleDelta(chars: chars, spans: spans) }
+        if cfg.lexiconEnabled { learnLexiconDelta(chars: chars, spans: spans) }
+    }
+
+    // Record the user's VOICE from the buffer text written since the last flush.
+    //
+    // Two rules, both learned the hard way:
+    //   • A watermark, exactly like the lexicon's. Without one, every flush re-offered the
+    //     whole buffer, so the same paragraph was recorded over and over.
+    //   • Only the model's insertions AND resynced host text are cut out; a held key is
+    //     still something this person typed. Resynced text is the important one: a caret
+    //     resync fills the buffer with up to 500 characters of whatever the host app had in
+    //     the field — mail someone else sent, a document someone else wrote — and
+    //     `invalidateAndResync` calls this method, so every arrow key used to be able to
+    //     file a stranger's prose under "the user's voice".
+    func learnStyleDelta(chars: [Character], spans: [UnlearnableSpan]?) {
+        let learned = min(styleWatermark[activeAppKey] ?? 0, chars.count)
+        guard chars.count > learned else { return }
+        styleWatermark[activeAppKey] = chars.count
+        guard let spans else { return }        // unattributable: advance, learn nothing
+        let foreign = spans.filter { UnlearnableSpan.notTheUsersVoice.contains($0.source) }
+        // Each surviving run is recorded on its own — StyleMemory drops anything under four
+        // words, so a fragment left either side of an accepted suggestion doesn't qualify.
+        for run in LearnableSpans.runs(in: chars, excluding: foreign, from: learned) {
+            styleMemory.record(run, category: appCategory())
+        }
     }
 
     // Learn only the buffer text typed since the last flush — the watermark makes
     // repeated flushes of a persisting buffer (e.g. app switches back and forth)
-    // count each word once.
-    func learnLexiconDelta() {
-        let learned = min(lexiconWatermark[activeAppKey] ?? 0, buffer.count)
-        guard buffer.count > learned else { return }
-        lexicon.learn(from: String(buffer.dropFirst(learned)))
-        lexiconWatermark[activeAppKey] = buffer.count
+    // count each word once. Text typer inserted, and text a held key produced, are cut
+    // out of the delta before it reaches the vocabulary table: the first would be the
+    // model learning from itself, the second is where "wwwww" came from.
+    func learnLexiconDelta(chars: [Character], spans: [UnlearnableSpan]?) {
+        let learned = min(lexiconWatermark[activeAppKey] ?? 0, chars.count)
+        guard chars.count > learned else { return }
+        lexiconWatermark[activeAppKey] = chars.count
+        guard let spans else { return }        // unattributable: advance, learn nothing
+        let runs = LearnableSpans.runs(in: chars, excluding: spans, from: learned)
+        guard !runs.isEmpty else { return }
+        // Joined with a space, never concatenated: gluing the two sides of a removed span
+        // together would invent a word ("hel" + "lo" was never typed as "hello").
+        lexicon.learn(from: runs.joined(separator: " "))
         // Teach the spell checker the user's vocabulary so their jargon/names stop being
         // flagged as typos. Unconditional — it only reduces false positives.
         syncLexiconToSpellChecker()
@@ -344,6 +449,12 @@ final class TyperApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buffer = buffersByApp[key] ?? ""
         lastInput = lastInputByApp[key] ?? Date.distantPast
         clearSuggestion()
+        // A different app is a materially different context: whatever was rejected over
+        // there says nothing about what should show here, and the text typed since the last
+        // caret move was typed in a field we are no longer in.
+        lastRejected = nil
+        lastPresentedTail = ""
+        typedSinceNav = ""
         // Switching apps starts fresh: drop the previous app's background context and
         // caret cache so the new app re-derives its own. Per-app buffers persist; the
         // (global) style memory intentionally carries across apps for personalization.
@@ -351,18 +462,18 @@ final class TyperApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         backgroundRefreshedAt = .distantPast
         backgroundKey = ""
         styleSampleAt = .distantPast    // re-rank the style sample for the new app's text
-        shotCaretPoint = nil
-        shotCaretApp = ""
+        // An app switch is a focused-element change: drop every cached caret geometry,
+        // font, line height and width calibration so nothing leaks between fields.
         // A click into a different app's field switches apps THROUGH this path; that
         // click's anchor must survive (it's stamped to the new app moments later in the
         // deferred resync). Only drop a stale anchor from a non-click switch (⌘-Tab etc).
-        if !clickCaretPending {
-            clickCaretPoint = nil
-            clickCaretApp = ""
+        //
+        // Re-pointing the observer normally performs exactly that reset (the new app's
+        // focused element is a different element), so it is done HERE only when the
+        // observer did not do it — otherwise every app switch ran the invalidation twice.
+        if !updateAXObserver(dropClickAnchor: !clickCaretPending) {
+            invalidateCaretForFocusChange(dropClickAnchor: !clickCaretPending)
         }
-        lastCaretPoint = nil
-        caretHeightFloor = nil      // fresh font-size measurement per focus session
-        updateAXObserver()          // follow the new app's focused element
         log("[\(activeAppKey)] restored buffer chars=\(buffer.count)")
     }
 
@@ -372,21 +483,97 @@ final class TyperApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // Append typed/inserted text to the per-app buffer (no UI side effects).
-    func appendToBuffer(_ text: String) {
+    //
+    // `learnable: false` marks the appended text as something the user did not write —
+    // typer's own accepted suggestion, or a burst from a held key. The span is remembered
+    // so `recordLearning` can subtract it; the text itself still goes into the buffer,
+    // because the buffer's other job is to mirror what is actually in the field.
+    //
+    // The sanitizer runs here too, as defence in depth. The event tap already refuses to
+    // hand a control character to this path, but this is the single funnel every buffer
+    // append goes through (typing, accepts, Shift-Return, emoji expansion), and a store is
+    // only as clean as its narrowest gate.
+    func appendToBuffer(_ text: String, learnable: Bool = true) {
+        let cleaned = TextSanitizer.stripped(TextSanitizer.strippingInvisibles(text))
+        guard !cleaned.isEmpty else { return }
         if Date().timeIntervalSince(lastInput) > Double(cfg.idleResetSeconds) {
             buffer = ""
+            typedSinceNav = ""
             lexiconWatermark[activeAppKey] = 0
+            styleWatermark[activeAppKey] = 0
+            unlearnableSpans[activeAppKey] = []
         }
-        buffer += text
-        if buffer.count > 4000 {
-            // Front-truncation shifts every index; pull the lexicon watermark back by
-            // the same amount so it keeps pointing at the same (kept) text.
-            let over = buffer.count - 4000
-            buffer = String(buffer.suffix(4000))
-            lexiconWatermark[activeAppKey] = max(0, (lexiconWatermark[activeAppKey] ?? 0) - over)
+        if !learnable {
+            unlearnableSpans[activeAppKey, default: []]
+                .append(UnlearnableSpan(start: buffer.count, text: cleaned, source: unlearnableSource))
         }
+        buffer += cleaned
+        // Everything that reaches the buffer while a re-sync is pending is text going in at
+        // the CURRENT caret, so it is also the trustworthy tail the re-sync falls back to.
+        typedSinceNav += cleaned
+        if buffer.count > 4000 { truncateBufferFront(keeping: 4000) }
         lastInput = Date()
         saveActiveAppState()
+    }
+
+    // Drop everything but the last `keep` characters of the buffer, re-basing every index
+    // that points into it. Front-truncation shifts them all: the lexicon and style
+    // watermarks and every recorded unlearnable span have to move back by the same amount
+    // or they end up describing the wrong text.
+    func truncateBufferFront(keeping keep: Int) {
+        let over = buffer.count - max(0, keep)
+        guard over > 0 else { return }
+        buffer = String(buffer.suffix(max(0, keep)))
+        lexiconWatermark[activeAppKey] = max(0, (lexiconWatermark[activeAppKey] ?? 0) - over)
+        styleWatermark[activeAppKey] = max(0, (styleWatermark[activeAppKey] ?? 0) - over)
+        unlearnableSpans[activeAppKey] = LearnableSpans.shifted(unlearnableSpans[activeAppKey] ?? [],
+                                                               byRemoving: over)
+        if typedSinceNav.count > buffer.count { typedSinceNav = String(typedSinceNav.suffix(buffer.count)) }
+    }
+
+    // Adopt text read back out of the HOST app's AXValue as the buffer (a caret re-sync).
+    //
+    // Nobody typed this in this session — it is whatever happened to be in the field, which
+    // is routinely a document or a message someone else wrote — so the whole of it is
+    // recorded as one `.resync` span. That keeps it out of the vocabulary (which excludes
+    // every span) AND out of the style memory (which now excludes `.resync` alongside the
+    // model's own insertions). Before this, a single arrow key could file 500 characters of
+    // a stranger's prose in style.txt as the user's voice.
+    //
+    // `keepSuggestionMemory` is for the one re-sync that is a reconciliation rather than an
+    // invalidation — the caret moved, the user typed on, and the suggestion on screen is
+    // still theirs — where dropping the rejection bookkeeping would orphan the suggestion
+    // that is still up.
+    func adoptResyncedBuffer(_ text: String, keepSuggestionMemory: Bool = false) {
+        buffer = text
+        typedSinceNav = ""
+        lexiconWatermark[activeAppKey] = text.count
+        styleWatermark[activeAppKey] = text.count
+        unlearnableSpans[activeAppKey] = text.isEmpty
+            ? []
+            : [UnlearnableSpan(start: 0, text: text, source: .resync)]
+        if !keepSuggestionMemory {
+            lastRejected = nil          // a new buffer is a materially different context
+            lastPresentedTail = ""
+        }
+    }
+
+    // Replace the whole buffer, dropping the per-app learning bookkeeping with it.
+    // `learned: true` (the default) marks the new text as already accounted for: resynced
+    // text was not necessarily typed by this user in this session (it may be pasted or
+    // pre-existing), so the lexicon must not claim it.
+    func resetBuffer(to text: String = "", learned: Bool = true) {
+        buffer = text
+        typedSinceNav = ""
+        // The buffer is authoritative again (a Return, a hand reset), so there is nothing
+        // left for a pending re-sync to protect against — without this, a Return landing
+        // inside a re-sync window would clamp the prompt to an empty `typedSinceNav`.
+        navResyncPending = false
+        lexiconWatermark[activeAppKey] = learned ? text.count : 0
+        styleWatermark[activeAppKey] = learned ? text.count : 0
+        unlearnableSpans[activeAppKey] = []
+        lastRejected = nil          // a new buffer is a materially different context
+        lastPresentedTail = ""
     }
 
     // Used for non-typed buffer changes (e.g. Shift-Return newline): reset the
@@ -433,12 +620,22 @@ final class TyperApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Low Power Mode. Drives a longer debounce and disables speculative prefetch.
     var powerSaving: Bool { cfg.batterySaver && PowerState.shared.saving }
 
-    func clearSuggestion() {
+    // `recordOutcome: false` tears the suggestion down WITHOUT judging it. Caret
+    // navigation (an arrow key, ⌘←, ⌃A, Find) is not an opinion about the suggestion —
+    // logging it as a rejection is what dragged the measured acceptance rate to ~0.12,
+    // which then raised the confidence gate, clamped suggestions to three words and left
+    // both router arms at a ~0.02 mean reward. The pending training example is discarded
+    // rather than written out as `accepted: false`.
+    func clearSuggestion(recordOutcome: Bool = true) {
         // A suggestion that vanishes without going through resolveCompletionOutcome
         // (app switch, click, paste, disable) still has an outcome: whatever was taken
         // before it was abandoned. Any consumed words came from typing through it.
         let consumed = completion?.consumed ?? 0
-        flushTrainingOutcome(consumedChars: consumed, acceptKind: consumed > 0 ? "typethrough" : "none", reason: "dismissed")
+        if recordOutcome {
+            flushTrainingOutcome(consumedChars: consumed, acceptKind: consumed > 0 ? "typethrough" : "none", reason: "dismissed")
+        } else {
+            pendingTraining = nil
+        }
         reanchorWork?.cancel()
         settleWork?.cancel()
         // An explicit dismissal (Esc/click/app switch) must also end the post-accept

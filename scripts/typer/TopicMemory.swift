@@ -42,8 +42,18 @@ final class TopicMemory {
         return cached!
     }
 
-    func record(_ e: TopicEntry) {
+    func record(_ rawEntry: TopicEntry) {
+        guard !rawEntry.keys.isEmpty else { return }
+        // OCR and AX text both drag invisible formatting in. It carries no meaning, so it
+        // is removed rather than used as grounds to throw an otherwise-good entry away.
+        let e = TopicEntry(at: rawEntry.at, app: rawEntry.app, title: rawEntry.title,
+                           keys: rawEntry.keys.map(TextSanitizer.strippingInvisibles).filter { !$0.isEmpty },
+                           note: TextSanitizer.strippingInvisibles(rawEntry.note))
         guard !e.keys.isEmpty else { return }
+        // Both halves of the entry can end up in a prompt — the keys via the match, the
+        // note verbatim — so a single bad scalar STILL there drops the whole entry. OCR is
+        // the usual source of U+FFFD and private-use glyphs here.
+        guard TopicMemory.isUsable(e) else { return }
         lock.lock()
         var all = cached ?? (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode([TopicEntry].self, from: $0) } ?? []
         // Replace any prior capture of the same view (same app + title) so we keep the
@@ -56,11 +66,18 @@ final class TopicMemory {
         persist(all)
     }
 
+    // An entry is usable only if every match key and the resurfacing note are clean —
+    // the shared gate for both the write path and the read path, so a hand-edited or
+    // pre-sanitizer topics.json can never feed a prompt.
+    static func isUsable(_ e: TopicEntry) -> Bool {
+        TextSanitizer.isClean(e.note) && e.keys.allSatisfy(TextSanitizer.isClean)
+    }
+
     // The note for the most recent entry whose keys appear in `text`, or nil. This is
     // the "only when there's a clear entity match" gate.
     func relevant(to text: String) -> String? {
         let hay = " " + text.lowercased() + " "
-        for e in entries().reversed() {
+        for e in entries().reversed() where TopicMemory.isUsable(e) {
             if e.keys.contains(where: { hay.contains($0) }) { return e.note }
         }
         return nil

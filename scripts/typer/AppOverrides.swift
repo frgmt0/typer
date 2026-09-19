@@ -18,7 +18,6 @@ struct AppOverrides: Codable, Equatable {
     var autocorrectDisabled: Bool?
     var emojiCompletionsDisabled: Bool?
     var emojiSearchDisabled: Bool?
-    var textMirroringEnabled: Bool?
     var needsEnhancedUserInterface: Bool?
     var ignoreSizeThresholds: Bool?
     var requiresPasteAndMatchStyleWorkaround: Bool?
@@ -40,7 +39,6 @@ struct AppOverrides: Codable, Equatable {
         if let v = autocorrectDisabled { r.autocorrectDisabled = v }
         if let v = emojiCompletionsDisabled { r.emojiCompletionsDisabled = v }
         if let v = emojiSearchDisabled { r.emojiSearchDisabled = v }
-        if let v = textMirroringEnabled { r.textMirroringEnabled = v }
         if let v = needsEnhancedUserInterface { r.needsEnhancedUserInterface = v }
         if let v = ignoreSizeThresholds { r.ignoreSizeThresholds = v }
         if let v = requiresPasteAndMatchStyleWorkaround { r.requiresPasteAndMatchStyleWorkaround = v }
@@ -81,9 +79,10 @@ final class OverrideStore {
         d["com.microsoft.Word"] = word
         var outlook = AppOverrides(); outlook.needsEnhancedUserInterface = true
         d["com.microsoft.Outlook"] = outlook
-        // Google Docs has no usable AX text tree → route through TextMirror (B.5).
-        var docs = AppOverrides(); docs.textMirroringEnabled = true
-        d["domain:docs.google.com"] = docs
+        // (docs.google.com used to be routed through TextMirror here. Nothing on the caret
+        // path has read `textMirroringEnabled` since the mirror tier was disabled, so the
+        // field and the row are gone; Docs is handled by the screen-reader-support prompt
+        // in TyperApp+Caret, after which the ordinary bounds/marker tiers work.)
         return d
     }()
 

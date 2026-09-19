@@ -429,9 +429,15 @@ extension TyperApp {
         Admissibility.shared.reset()     // per-app capture backoff state
         InlinePrediction.clearRecord()   // forget the saved prior NSAutomaticInlinePrediction value (review L4)
         stats = TyperStats(); stats.save()
-        buffer = ""; buffersByApp.removeAll(); lastInputByApp.removeAll()
+        buffer = ""; typedSinceNav = ""; buffersByApp.removeAll(); lastInputByApp.removeAll()
+        // Every index that points into a per-app buffer has to go with the buffers. Leaving
+        // `unlearnableSpans` behind was silent, permanent damage: the spans described text
+        // that no longer existed, so `LearnableSpans.verified` returned nil on every flush
+        // from then on and learning simply stopped — for good, with no way to tell.
         lexiconWatermark.removeAll()
-        cachedBackground = ""; lastTrailing = ""
+        styleWatermark.removeAll()
+        unlearnableSpans.removeAll()
+        cachedBackground = ""; lastTrailing = ""; lastPresentedTail = ""; lastRejected = nil
         clearSuggestion()
         updateStatusTitle()
         log("user reset all data")

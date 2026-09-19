@@ -57,20 +57,37 @@ final class PersonalLexicon {
         return counts!
     }
 
+    // The shape a lexicon entry must have, as a pure check so the write path, the read
+    // path and the store migration can never disagree: letters (plus inner apostrophes)
+    // only, no disallowed scalars, and no held-key run. `hasHeldKeyRun` is what keeps
+    // auto-repeat artifacts like "wwwww" or "aaaaaaaa" — a key leaned on, not a word —
+    // out of the bias pool.
+    static func isAcceptableWord(_ w: String) -> Bool {
+        guard !w.isEmpty, w.first != "'", w.last != "'" else { return false }
+        guard TextSanitizer.isClean(w), !TextSanitizer.hasHeldKeyRun(w) else { return false }
+        return w.allSatisfy { $0.isLetter || $0 == "'" }
+    }
+
     // Words eligible for the lexicon: letters (plus inner apostrophe), 4–24 chars,
     // not a stop word. Anything with digits, URLs, paths, emails never qualifies —
-    // both for privacy and because token-biasing them would be useless.
+    // both for privacy and because token-biasing them would be useless. Control
+    // characters and held-key runs are rejected outright: a stray arrow key used to
+    // split a word here and leave the fragment behind, and a leaned-on key used to
+    // enter the table as its own "word".
     private func eligibleWords(in text: String) -> [String] {
         text.lowercased().split { !$0.isLetter && $0 != "'" }.compactMap { raw in
             let w = raw.trimmingCharacters(in: CharacterSet(charactersIn: "'"))
             guard w.count >= 4, w.count <= 24, !lexiconStopWords.contains(w),
-                  w.allSatisfy({ $0.isLetter || $0 == "'" }) else { return nil }
+                  Self.isAcceptableWord(w) else { return nil }
             return w
         }
     }
 
     func learn(from text: String) {
-        let words = eligibleWords(in: text)
+        // Invisible formatting would otherwise split a word in two ("ca<U+200E>fe" →
+        // "ca", "fe") and enter both halves as vocabulary. It is not a character anyone
+        // typed, so it comes out before the text is split at all.
+        let words = eligibleWords(in: TextSanitizer.strippingInvisibles(text))
         guard !words.isEmpty else { return }
         lock.lock()
         var c = loadedCounts()
@@ -106,7 +123,10 @@ final class PersonalLexicon {
         lock.lock(); defer { lock.unlock() }
         if Date().timeIntervalSince(cachedTopAt) < 60 { return cachedTop }
         let c = loadedCounts()
-        cachedTop = c.filter { $0.value >= 3 }
+        // Filter on read as well as on write: lexicon.json is a plain JSON file the
+        // user can hand-edit, and pre-sanitizer installs left artifacts in it. Nothing
+        // malformed may reach the prompt or the helper's bias table.
+        cachedTop = c.filter { $0.value >= 3 && Self.isAcceptableWord($0.key) }
             .sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
             .prefix(n).map { $0.key }.joined(separator: " ")
         cachedTopAt = Date()
@@ -115,7 +135,7 @@ final class PersonalLexicon {
 
     func wordCount() -> Int {
         lock.lock(); defer { lock.unlock() }
-        return loadedCounts().filter { $0.value >= 3 }.count
+        return loadedCounts().filter { $0.value >= 3 && Self.isAcceptableWord($0.key) }.count
     }
 
     func clear() {

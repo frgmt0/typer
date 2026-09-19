@@ -29,13 +29,8 @@ enum CorrectionColors {
 
 final class SuggestionOverlay: NSPanel {
     private let ghost = GhostView(frame: NSRect(x: 0, y: 0, width: 420, height: 38))
-
-    // The host field's real font/color, read over AX (spec B.2) by the caret subsystem
-    // and stashed here just before placement. When set, the inline ghost renders in the
-    // host typography instead of NSFont.systemFont, which is what removes fast-typing
-    // horizontal drift on monospace/condensed/proportional fonts. nil = system fallback.
-    var pendingHostFont: NSFont?
-    var pendingHostColor: NSColor?
+    // The widest the ghost may ever be. Clamped to the screen on top of this.
+    private let maxGhostWidth: CGFloat = 760
 
     init() {
         super.init(contentRect: NSRect(x: 0, y: 0, width: 420, height: 38),
@@ -51,23 +46,23 @@ final class SuggestionOverlay: NSPanel {
         orderOut(nil)
     }
 
-    private func fontSize(for lineHeight: CGFloat) -> CGFloat { min(max(lineHeight * 0.62, 11), 30) }
-
-    func showCompletion(_ text: String, at point: NSPoint, lineHeight: CGFloat, animate: Bool) {
-        // Prefer the host font (B.2); fall back to the system font sized to the caret line.
-        let font = pendingHostFont ?? NSFont.systemFont(ofSize: fontSize(for: lineHeight))
-        let fs = font.pointSize
-        let base = pendingHostColor ?? NSColor.labelColor
+    // The caret fix carries the font, colour, line height and the caret point; the overlay
+    // holds no typography state of its own. (A stashed host font used to win over the
+    // clamped fallback unconditionally, so a single bad AX font read produced a 48pt ghost
+    // for the rest of the session.)
+    func showCompletion(_ text: String, at fix: CaretFix, animate: Bool) {
         let attr = NSAttributedString(string: text, attributes: [
-            .font: font, .foregroundColor: base.withAlphaComponent(0.5)])
-        place(attr, fontSize: fs, font: font, at: point, lineHeight: lineHeight, shimmer: animate)
+            .font: fix.font, .foregroundColor: fix.color.withAlphaComponent(0.5)])
+        place(attr, font: fix.font, at: fix, shimmer: animate)
     }
 
     // Inline diff for a pending correction. Spelling, and grammar with a fix, render the
     // red-strike original → green replacement. Advisory-only grammar (no replacement)
     // shows just its message in amber — Tab passes through, there's nothing to apply.
-    func show(correction c: Correction, at point: NSPoint, lineHeight: CGFloat) {
-        let fs = fontSize(for: lineHeight)
+    // The diff is always drawn in the system font (a diff arrow in a condensed host font
+    // is unreadable) but at the caret's clamped size.
+    func show(correction c: Correction, at fix: CaretFix) {
+        let fs = fix.font.pointSize
         let s = NSMutableAttributedString()
         if let replacement = c.replacement {
             // Typo struck through in red, fix in green right after — the named-color diff (#8).
@@ -85,28 +80,37 @@ final class SuggestionOverlay: NSPanel {
                 .font: NSFont.systemFont(ofSize: fs, weight: .medium),
                 .foregroundColor: CorrectionColors.advisoryAmber.withAlphaComponent(0.95)]))
         }
-        place(s, fontSize: fs, font: NSFont.systemFont(ofSize: fs), at: point, lineHeight: lineHeight, shimmer: true)
+        place(s, font: NSFont.systemFont(ofSize: fs), at: fix, shimmer: true)
     }
 
-    // `point` is the caret's right edge (x) and bottom (y). The panel is the caret
-    // line height, so the text is vertically centered on the caret line (inline).
-    private func place(_ attr: NSAttributedString, fontSize fs: CGFloat, font: NSFont, at point: NSPoint, lineHeight: CGFloat, shimmer: Bool) {
-        let textW = ceil(attr.size().width)
+    // `fix.pointAppKit` is the caret's right edge (x) and line bottom (y). The panel is
+    // the caret line height, so the text is vertically centered on the caret line (inline).
+    //
+    // The screen is chosen by the caret POINT — never by intersecting the (up to 760pt
+    // wide) ghost frame, which made the ghost hop to the neighbouring display, and never
+    // NSScreen.main, which is "wherever the key window is". No screen owns the point =>
+    // we do not know where this belongs, so nothing is drawn.
+    private func place(_ attr: NSAttributedString, font: NSFont, at fix: CaretFix, shimmer: Bool) {
+        let screens = NSScreen.screens
+        guard let hit = CaretGeometry.screenContaining(point: fix.pointAppKit, in: screens.map(\.frame)),
+              let screen = screens.first(where: { $0.frame == hit }) else { orderOut(nil); return }
         let taperW: CGFloat = 20
-        let w = min(textW + 8, 760)
-        let h = max(lineHeight, 14)
-        var frame = NSRect(x: point.x, y: point.y, width: w, height: h)
-        if let screen = NSScreen.screens.first(where: { $0.visibleFrame.intersects(frame) }) ?? NSScreen.main {
-            let v = screen.visibleFrame.insetBy(dx: 8, dy: 8)
-            frame.origin.x = min(max(frame.origin.x, v.minX), v.maxX - frame.width)
-            frame.origin.y = min(max(frame.origin.y, v.minY), v.maxY - frame.height)
-        }
+        let textW = ceil(attr.size().width)
+        let requested = NSRect(x: fix.pointAppKit.x, y: fix.pointAppKit.y,
+                               width: min(textW + 8, maxGhostWidth),
+                               height: CaretGeometry.panelHeight(forLineHeight: fix.lineHeight, fontSize: fix.font.pointSize))
+        // Truncate to fit, never shift left over the text the user is typing.
+        let frame = CaretGeometry.clampGhostFrame(requested, toScreen: screen.visibleFrame)
+        guard frame.width >= 12, frame.height >= 8 else { orderOut(nil); return }
         let wasVisible = isVisible
+        // Follow the display the ghost actually lands on: a scale fixed at construction
+        // renders blurry (or oversampled) text on every other monitor.
+        ghost.setContentsScale(screen.backingScaleFactor)
         setFrame(frame, display: true)
         ghost.frame = NSRect(origin: .zero, size: frame.size)
         // Shimmer only on a genuinely fresh appearance — never while streaming updates
         // or shrinking as the user types through it.
-        ghost.render(attr, fontSize: fs, font: font, taperWidth: taperW, shimmer: shimmer && !wasVisible)
+        ghost.render(attr, font: font, taperWidth: taperW, shimmer: shimmer && !wasVisible)
         if !wasVisible {
             ghost.fadeIn()
             orderFrontRegardless()

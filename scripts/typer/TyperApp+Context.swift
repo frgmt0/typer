@@ -470,8 +470,8 @@ extension TyperApp {
             // `cfg.personalizationStrength` (0..1). Strength 0 (the default) keeps the
             // established baseline so the working style feature never regresses; higher
             // strength widens the sample (up to 1.5×) so the completion leans harder toward
-            // how the user writes. The seam for the W4 logit-bias map is the companion
-            // `personalizedLexicon()` on the completion side.
+            // how the user writes. The companion channel is `personalizedLexicon()` on the
+            // completion side, which ships the words themselves.
             let baseChars = immediate.count < cfg.maxImmediateForBackground ? 360 : 160
             let maxChars = Int((Double(baseChars) * (1.0 + 0.5 * cfg.personalizationStrength)).rounded())
             if Date().timeIntervalSince(styleSampleAt) > 5 || styleSampleChars != maxChars {
@@ -488,11 +488,17 @@ extension TyperApp {
         // can never crowd it out. The leader client serves the tokenizer; budgeting falls
         // back to a char estimate if the helper isn't up yet (degrades gracefully, never
         // blocks input). Budget leaves headroom for generation inside the helper's 1536 ctx.
+        // Belt and braces on the way out. Everything above is screened at its own source
+        // (AX text, OCR, clipboard, style memory, per-app instructions), but this is the
+        // single string that reaches the model, and one control or private-use scalar in a
+        // greedily-decoded prompt is enough to make the helper echo it forever. The helper
+        // strips again on its side; neither gate is load-bearing alone.
         if let client = router?.client(for: .a) {
-            return client.budgetedContext(blocks: blocks, immediate: immediate, tokenBudget: contextTokenBudget)
+            return TextSanitizer.stripped(client.budgetedContext(blocks: blocks, immediate: immediate,
+                                                                 tokenBudget: contextTokenBudget))
         }
         blocks.append(immediate)
-        return blocks.count == 1 ? immediate : blocks.joined(separator: "\n\n")
+        return TextSanitizer.stripped(blocks.count == 1 ? immediate : blocks.joined(separator: "\n\n"))
     }
 
     // Resolve the instruction text to inject for the current app (#1, spec E §1). Per-app

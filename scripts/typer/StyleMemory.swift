@@ -46,10 +46,20 @@ final class StyleMemory {
     }
 
     func record(_ text: String, category: String = "") {
-        var t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        t = t.replacingOccurrences(of: "\t", with: " ")   // tab is the format delimiter
+        var t = text.replacingOccurrences(of: "\t", with: " ")   // tab is the format delimiter
+        // Invisible formatting (a byte-order mark, a bidi mark) rides in on the AX text an
+        // app hands us; it is not something anyone typed and nobody can see it. Remove it
+        // before judging the line — dropping a whole otherwise-good sentence over a
+        // character with no visual extent threw away 17 style lines on real data.
+        t = TextSanitizer.strippingInvisibles(t).trimmingCharacters(in: .whitespacesAndNewlines)
         // Only keep substantive, sentence-like writing — not stray words.
         guard t.split(separator: " ").count >= 4 else { return }
+        // Drop the whole line if anything unprintable is STILL there after the invisibles
+        // came out (a stray arrow/Home/F-key used to land here as a control character).
+        // Dropping beats stripping for those: a sentence with visible characters quietly
+        // removed is worse style evidence than no sentence at all, and there is always
+        // another sentence coming.
+        guard TextSanitizer.isClean(t), TextSanitizer.isClean(category) else { return }
         lock.lock()
         var existing = cached ?? (try? String(contentsOf: url, encoding: .utf8)) ?? ""
         // Dedupe: skip if this exact text is among the most recent entries (the
@@ -72,6 +82,9 @@ final class StyleMemory {
         let recent = contents().split(separator: "\n").map(String.init).reversed()
         var ranked: [(score: Int, recency: Int, line: String)] = []
         for (i, raw) in recent.enumerated() {
+            // style.txt is plain text the user can edit, and installs predating the
+            // sanitizer left control characters in it — never let one reach a prompt.
+            guard TextSanitizer.isClean(raw) else { continue }
             let (cat, line) = parse(raw)
             let words = Set(line.lowercased().split { !$0.isLetter && !$0.isNumber }
                 .map(String.init).filter { $0.count >= 4 })
@@ -96,7 +109,9 @@ final class StyleMemory {
     }
 
     func sentenceCount() -> Int {
-        contents().split(separator: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.count
+        contents().split(separator: "\n").filter {
+            !$0.trimmingCharacters(in: .whitespaces).isEmpty && TextSanitizer.isClean(String($0))
+        }.count
     }
 
     func clear() {

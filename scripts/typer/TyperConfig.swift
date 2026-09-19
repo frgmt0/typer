@@ -30,9 +30,9 @@ struct TyperConfig {
     var minContextChars = 6
 
     // ── Overhaul (Wave 0) new fields ──────────────────────────────────────────
-    // Personalization strength 0..1: interim mechanism scales style-sample chars +
-    // lexicon weight and builds a logit-bias map from the user's frequent words
-    // (W2A surfaces the slider, W2B/W4 consume it). 0 = neutral.
+    // Personalization strength 0..1: scales the style-sample size and how many of the
+    // user's frequent words ride along to the helper's sampler (which applies a fixed
+    // per-word first-token boost). 0 = neutral, and sends nothing at all.
     var personalizationStrength: Double = 0
     // Suggested-fix styling (#8): draw the red-strike → green-replacement inline diff.
     var showSuggestedFixes = true

@@ -1,5 +1,7 @@
 #include "llama.h"
 
+#include "llama_server_text.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cctype>
@@ -15,254 +17,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-
-static std::string json_get_string(const std::string &s, const std::string &key) {
-    std::string pat = "\"" + key + "\"";
-    size_t p = s.find(pat);
-    if (p == std::string::npos) return "";
-    p = s.find(':', p + pat.size());
-    if (p == std::string::npos) return "";
-    p = s.find('"', p);
-    if (p == std::string::npos) return "";
-    std::string out;
-    bool esc = false;
-    for (size_t i = p + 1; i < s.size(); ++i) {
-        char c = s[i];
-        if (esc) {
-            switch (c) {
-                case 'n': out += '\n'; break;
-                case 't': out += '\t'; break;
-                case 'r': out += '\r'; break;
-                case '"': out += '"'; break;
-                case '\\': out += '\\'; break;
-                default: out += c; break;
-            }
-            esc = false;
-        } else if (c == '\\') {
-            esc = true;
-        } else if (c == '"') {
-            break;
-        } else {
-            out += c;
-        }
-    }
-    return out;
-}
-
-static int json_get_int(const std::string &s, const std::string &key, int def) {
-    std::string pat = "\"" + key + "\"";
-    size_t p = s.find(pat);
-    if (p == std::string::npos) return def;
-    p = s.find(':', p + pat.size());
-    if (p == std::string::npos) return def;
-    ++p;
-    while (p < s.size() && std::isspace((unsigned char)s[p])) ++p;
-    char *end = nullptr;
-    long v = std::strtol(s.c_str() + p, &end, 10);
-    return end == s.c_str() + p ? def : (int)v;
-}
-
-static double json_get_double(const std::string &s, const std::string &key, double def) {
-    std::string pat = "\"" + key + "\"";
-    size_t p = s.find(pat);
-    if (p == std::string::npos) return def;
-    p = s.find(':', p + pat.size());
-    if (p == std::string::npos) return def;
-    ++p;
-    while (p < s.size() && std::isspace((unsigned char)s[p])) ++p;
-    char *end = nullptr;
-    double v = std::strtod(s.c_str() + p, &end);
-    return end == s.c_str() + p ? def : v;
-}
-
-static std::string json_escape(const std::string &s) {
-    std::string out;
-    out.reserve(s.size() + 8);
-    for (unsigned char c : s) {
-        switch (c) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if (c < 0x20) {
-                    char buf[7];
-                    snprintf(buf, sizeof(buf), "\\u%04x", c);
-                    out += buf;
-                } else {
-                    out += (char)c;
-                }
-        }
-    }
-    return out;
-}
-
-static std::string trim(std::string s) {
-    while (!s.empty() && std::isspace((unsigned char)s.front())) s.erase(s.begin());
-    while (!s.empty() && std::isspace((unsigned char)s.back())) s.pop_back();
-    return s;
-}
-
-static bool contains_special_fragment(const std::string &s) {
-    return s.find("<|") != std::string::npos || s.find("|>") != std::string::npos || s.find("<turn") != std::string::npos;
-}
-
-static std::string lower_ascii(std::string s) {
-    for (char &c : s) c = (char)std::tolower((unsigned char)c);
-    return s;
-}
-
-static bool looks_bad_completion(const std::string &s) {
-    std::string t = lower_ascii(trim(s));
-    if (t.empty()) return true;
-    if (contains_special_fragment(t)) return true;
-    if (t == "cont" || t == "continuation" || t == "text:" || t.rfind("continuation:", 0) == 0 || t.rfind("text:", 0) == 0) return true;
-    if (t.find("as an ai") != std::string::npos || t.find("i'm sorry") != std::string::npos) return true;
-    if (t.size() > 2) {
-        size_t p = t.find(' ');
-        if (p != std::string::npos) {
-            std::string w = t.substr(0, p);
-            int repeats = 0;
-            size_t off = 0;
-            while (off < t.size()) {
-                if (t.compare(off, w.size(), w) == 0) repeats++;
-                size_t next = t.find(' ', off);
-                if (next == std::string::npos) break;
-                off = next + 1;
-            }
-            if (repeats >= 4) return true;
-        }
-    }
-    return false;
-}
-
-// Last non-space char of the context (0 if none) — lets the numeric gate tell
-// "the discount is " (prose) from "...is 5" (user mid-number).
-static char last_nonspace(const std::string &s) {
-    for (auto it = s.rbegin(); it != s.rend(); ++it)
-        if (!std::isspace((unsigned char)*it)) return *it;
-    return 0;
-}
-
-// A completion that is itself just a number, or LEADS with a percentage, is almost
-// always pollution from on-screen UI chrome (zoom "100%", battery, progress, a stat
-// readout) leaking through the context — not a real continuation of what the user is
-// writing. Drop it, UNLESS the user is mid-number (context ends in a digit), where
-// "5" -> "0%" or "12" -> ".5" is a legitimate continuation. This is the catch-all for
-// the "first suggestion is 100% / 90%" complaint regardless of where the digits came
-// from. `s` is the already-shaped completion (may have one leading space).
-static bool is_orphan_number(const std::string &s, const std::string &context) {
-    std::string t = trim(s);
-    if (t.empty()) return false;
-    if (std::isdigit((unsigned char)last_nonspace(context))) return false;  // user is mid-number
-    size_t i = 0;
-    if (t[i] == '$') i++;
-    bool saw_digit = false;
-    while (i < t.size() && (std::isdigit((unsigned char)t[i]) || t[i] == '.' || t[i] == ',')) {
-        if (std::isdigit((unsigned char)t[i])) saw_digit = true;
-        i++;
-    }
-    if (!saw_digit) return false;                    // no actual number (e.g. "...", ".", "$")
-    bool pct = (i < t.size() && t[i] == '%');
-    if (pct) i++;
-    std::string rest = trim(t.substr(i));
-    // Leading percentage ("90% off") or a bare number with nothing after ("100", "3.5").
-    return pct || rest.empty();
-}
-
-static std::string limit_words(const std::string &s, int max_words) {
-    std::string out;
-    int words = 0;
-    bool in_word = false;
-    for (char c : s) {
-        out += c;
-        if (std::isspace((unsigned char)c)) {
-            if (in_word) {
-                words++;
-                if (words >= max_words) break;
-            }
-            in_word = false;
-        } else {
-            in_word = true;
-        }
-    }
-    if (in_word) words++;
-    return trim(out);
-}
-
-// Remove HTML/XML-like tags (<em>, </strong>, <br/>, ...) that small models
-// sometimes emit in prose. A '<' that is not followed by a letter or '/' (e.g.
-// "a < b") is left intact, so code/math comparisons survive.
-static std::string strip_html_tags(const std::string &s) {
-    std::string out;
-    out.reserve(s.size());
-    for (size_t i = 0; i < s.size();) {
-        if (s[i] == '<' && i + 1 < s.size() &&
-            (s[i + 1] == '/' || std::isalpha((unsigned char)s[i + 1]))) {
-            size_t close = s.find('>', i + 1);
-            if (close != std::string::npos && close - i <= 40) { i = close + 1; continue; }
-        }
-        out += s[i++];
-    }
-    return out;
-}
-
-// Drop a trailing incomplete UTF-8 sequence. Token streaming can split a multibyte
-// character across two tokens; emitting the half would produce invalid UTF-8 in a
-// {"p":...} JSON line and the Swift side would reject the whole partial.
-static std::string utf8_safe(const std::string &s) {
-    size_t len = s.size();
-    if (len == 0) return s;
-    size_t i = len, cont = 0;
-    while (i > 0 && ((unsigned char)s[i - 1] & 0xC0) == 0x80 && cont < 3) { i--; cont++; }
-    if (i == 0) return s;
-    unsigned char lead = (unsigned char)s[i - 1];
-    size_t expected = (lead & 0x80) == 0x00 ? 1 :
-                      (lead & 0xE0) == 0xC0 ? 2 :
-                      (lead & 0xF0) == 0xE0 ? 3 :
-                      (lead & 0xF8) == 0xF0 ? 4 : 0;
-    if (expected == 0) return s;                 // invalid lead byte; leave as-is
-    if (len - (i - 1) < expected) return s.substr(0, i - 1);  // incomplete tail → drop
-    return s;
-}
-
-static std::string first_line_clean(std::string s) {
-    auto cut_marker = [&](const std::string &m) {
-        size_t p = s.find(m);
-        while (p != std::string::npos) { s.erase(p, m.size()); p = s.find(m); }
-    };
-    cut_marker("<|channel>thought<channel|>");
-    cut_marker("<|channel>final<channel|>");
-    cut_marker("<|channel>");
-    cut_marker("<channel|>");
-    cut_marker("<|think|>");
-    cut_marker("<turn|>");
-    cut_marker("<|turn>model");
-    cut_marker("<|turn>user");
-    s = strip_html_tags(s);
-    return trim(s);
-}
-
-static std::string remove_echo(std::string out, const std::string &context) {
-    out = trim(out);
-    for (const std::string &label : {"Continuation:", "Next words:", "Insert:", "Completion:"}) {
-        size_t lp = out.rfind(label);
-        if (lp != std::string::npos) out = trim(out.substr(lp + label.size()));
-    }
-    std::string ctx = trim(context);
-    if (ctx.empty()) return out;
-    size_t p = out.find(ctx);
-    if (p != std::string::npos) {
-        return trim(out.substr(p + ctx.size()));
-    }
-    for (size_t n = std::min<size_t>(ctx.size(), 120); n > 12; --n) {
-        std::string suffix = ctx.substr(ctx.size() - n);
-        p = out.find(suffix);
-        if (p != std::string::npos) return trim(out.substr(p + suffix.size()));
-    }
-    return out;
-}
 
 class LlamaEngine {
 public:
@@ -631,26 +385,6 @@ public:
     }
 };
 
-// Tail window with a STABLE start, mirroring the Swift side. A plain "last N bytes"
-// cut slides forward with every request, so the prompt's first tokens differ each
-// time and prepare_prompt's KV prefix reuse never fires — every request re-decodes
-// the whole prompt. Snapping the cut to a text boundary keeps the prompt prefix
-// identical across requests until the boundary leaves the search range.
-static std::string stable_tail(const std::string &s, size_t max_chars) {
-    if (s.size() <= max_chars) return s;
-    std::string tail = s.substr(s.size() - max_chars);
-    size_t strong = std::string::npos, space = std::string::npos;
-    for (size_t i = 0; i < max_chars / 2; ++i) {
-        char c = tail[i];
-        if (c == '\n' || c == '\r') { strong = i; break; }
-        if (i > 0 && c == ' ' && (tail[i-1] == '.' || tail[i-1] == '!' || tail[i-1] == '?')) { strong = i; break; }
-        if (space == std::string::npos && c == ' ') space = i;
-    }
-    size_t cut = strong != std::string::npos ? strong : space;
-    if (cut == std::string::npos || cut + 1 >= tail.size()) return tail;
-    return tail.substr(cut + 1);
-}
-
 static std::string prompt_complete(const std::string &context) {
     // The prompt is the plain context. The model's real BOS (if it uses one) is prepended
     // at tokenize time via add_special — see generate(), which tokenizes with add_special
@@ -689,10 +423,15 @@ int main(int argc, char **argv) {
         std::string line;
         while (std::getline(std::cin, line)) {
             try {
-                std::string context = json_get_string(line, "context");
+                // strip_disallowed is the second line of defence behind the JSON
+                // unescaper: control / private-use / U+FFFD scalars and invalid UTF-8
+                // never carry meaning, and one of them in the context is enough to make
+                // a greedy decoder loop on it forever. Whatever the transport does, the
+                // prompt only ever sees text.
+                std::string context = strip_disallowed(json_get_string(line, "context"));
                 // Text AFTER the caret (spec §E#13). Present only for mid-line completions;
                 // empty for end-of-line, where the plain continuation path is used as before.
-                std::string suffix = json_get_string(line, "suffix");
+                std::string suffix = strip_disallowed(json_get_string(line, "suffix"));
                 int max_words = std::max(1, std::min(32, json_get_int(line, "max_words", 7)));
 
                 // Tokenize helper (W1B / spec C.4): count tokens for an arbitrary block so
@@ -721,12 +460,14 @@ int main(int argc, char **argv) {
                     continue;
                 }
 
-                if (context.size() > 2200) context = stable_tail(context, 2200);
+                // Both truncations cut on a byte offset and can split a multi-byte
+                // character, so re-strip afterwards to drop the orphaned bytes.
+                if (context.size() > 2200) context = strip_disallowed(stable_tail(context, 2200));
                 // Bound the FIM suffix: the trailing text only needs to be enough to
                 // condition the gap (the model fills BETWEEN prefix and suffix), and a
                 // huge trailing document would crowd the context. Keep the head (nearest
                 // the caret) since that is what the completion must agree with.
-                if (suffix.size() > 600) suffix.resize(600);
+                if (suffix.size() > 600) { suffix.resize(600); suffix = strip_disallowed(suffix); }
 
                 // Raw baseline path (eval_compare.py): greedy decode, harness logic stripped,
                 // only first-line + trim cleanup so the comparison reflects the model itself.
@@ -741,7 +482,7 @@ int main(int argc, char **argv) {
                                    << json_escape(out) << "\",\"conf\":" << cbuf << "}}\n" << std::flush;
                     continue;
                 }
-                engine.set_lexicon(json_get_string(line, "lexicon"),
+                engine.set_lexicon(strip_disallowed(json_get_string(line, "lexicon")),
                                    (float)json_get_double(line, "lexicon_bias", 0.5));
 
                 int max_tokens = std::max(8, std::min(18, max_words + 7));
@@ -790,7 +531,17 @@ int main(int argc, char **argv) {
                                 suppressed = true; return false;
                             }
                         }
-                        std::string shaped = utf8_safe(shape(s, false));
+                        // strip_format_scalars, not a rejection: an invisible (a BOM, a
+                        // zero-width space, a bidi mark) dragged in from the context is
+                        // not the model misbehaving, and the Swift side refuses text that
+                        // carries one — so clean it out and keep the completion.
+                        std::string shaped = strip_format_scalars(utf8_safe(shape(s, false)));
+                        // Output gate, mid-stream: a control / private-use / U+FFFD scalar
+                        // (or invalid UTF-8 that utf8_safe's incomplete-tail trim did not
+                        // explain) means the model is emitting garbage, not prose. Stop now
+                        // so it never flashes in the ghost text; `suppressed` makes the
+                        // final answer "no completion".
+                        if (has_disallowed_scalar(shaped)) { suppressed = true; return false; }
                         // A leading percentage ("100%") is unambiguous even mid-stream and
                         // is the classic OCR-chrome leak — kill it before it flashes. Bare
                         // numbers wait for the final gate (mid-stream "100" may yet become
@@ -827,7 +578,11 @@ int main(int argc, char **argv) {
 
                 std::string out;
                 if (!suppressed) {
-                    out = shape(first_line_clean(raw), true);
+                    // utf8_safe first: the token budget can end mid-character, and that
+                    // truncated tail is not the model misbehaving — trim it rather than
+                    // let looks_bad_completion's invalid-UTF-8 gate throw the whole
+                    // (otherwise good) completion away.
+                    out = strip_format_scalars(utf8_safe(shape(first_line_clean(raw), true)));
                     if (looks_bad_completion(out) || is_orphan_number(out, context)) out.clear();
                 }
                 if (out.empty()) {

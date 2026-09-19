@@ -24,9 +24,11 @@ final class GhostView: NSView {
         wantsLayer = true
         let root = CALayer()
         layer = root
-        let scale = NSScreen.main?.backingScaleFactor ?? 2
+        // Deliberately NOT NSScreen.main: the ghost follows the caret across displays, so
+        // the scale is set per placement from the screen it actually lands on (see
+        // setContentsScale). 2 is only the pre-first-placement default.
         for tl in [textLayer, shimmerMask] {
-            tl.contentsScale = scale; tl.truncationMode = .none; tl.isWrapped = false; tl.alignmentMode = .left
+            tl.contentsScale = 2; tl.truncationMode = .none; tl.isWrapped = false; tl.alignmentMode = .left
         }
         root.addSublayer(textLayer)
 
@@ -42,9 +44,21 @@ final class GhostView: NSView {
         root.mask = taper
     }
 
+    // Match the backing store to the display the ghost is about to appear on. Called from
+    // SuggestionOverlay.place on every placement; a no-op when the scale hasn't changed.
+    func setContentsScale(_ scale: CGFloat) {
+        let s = scale.isFinite && scale > 0 ? scale : 2
+        guard textLayer.contentsScale != s else { return }
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        textLayer.contentsScale = s
+        shimmerMask.contentsScale = s
+        layer?.contentsScale = s
+        CATransaction.commit()
+    }
+
     // `font` is the host field's real font (spec B.2) when known, else a system font; it
     // is used for the shimmer mask so the sweep matches the rendered ghost typography.
-    func render(_ attr: NSAttributedString, fontSize fs: CGFloat, font: NSFont, taperWidth: CGFloat, shimmer doShimmer: Bool) {
+    func render(_ attr: NSAttributedString, font: NSFont, taperWidth: CGFloat, shimmer doShimmer: Bool) {
         CATransaction.begin(); CATransaction.setDisableActions(true)   // no implicit anim on text/move
         let h = ceil(attr.size().height)
         let f = CGRect(x: inset, y: (bounds.height - h) / 2, width: max(0, bounds.width - inset), height: h)

@@ -3,6 +3,229 @@
 Typer is in **alpha** and not yet versioned. Entries are newest-first, led by the
 commit they landed in. Website: [typr.frgmt.xyz](https://typr.frgmt.xyz).
 
+## Arrow keys were being typed into the prompt
+
+An investigation into "the suggestions are bad" found the cause upstream of the model. The event
+tap filtered a handful of keys by name — Tab, backtick, Esc, Backspace, Return, ⌘/⌃/⌥ chords — and
+handed **everything else with a non-empty character payload** to the typing path. On this machine
+that meant the arrow keys arrived as U+001C–U+001F, Home/End/PgUp/PgDn as U+0001/0004/000B/000C,
+forward-delete as U+007F, every F-key as U+0010, Help as U+0005, keypad Enter as U+0003 and keypad
+Clear as U+001B. All of it was appended to the typed buffer — which *is* the prompt whenever an app
+won't expose its text over Accessibility — then written into the style memory, the vocabulary
+lexicon and the training corpus, and treated as "the user typed, generate again".
+
+- **Keys are classified by keycode now (`InputSanitizer.swift` new, `TyperApp+EventTap.swift`).**
+  A keycode is layout-independent — 123 is Left Arrow on Dvorak, AZERTY and a Czech layout alike —
+  while the produced character is precisely the thing that lies. Every key is sorted into text /
+  navigation / edit / backspace / submit / dismiss / accept / command / ignore before anything
+  reaches the buffer, and a key we believe is a text key still has to prove it produced text.
+  `appendToBuffer` screens again on the way in, so no future caller can reopen the hole.
+- **Caret navigation is no longer recorded as a rejection.** An arrow key while a suggestion was up
+  resolved it as an explicit "no": reward 0 to the model race, a negative to the adaptive feedback
+  layer, an `accepted: false` row in the training log. That dragged the measured acceptance rate to
+  ~0.12, which raised the confidence gate, clamped suggestions to three words and left both router
+  arms at a ~0.02 mean reward. Moving the cursor is not an opinion. A suggestion's outcome is now
+  resolved from exactly three things: an explicit accept, typing that diverges from it, or Esc.
+- **The buffer re-syncs when the caret moves.** It only ever did so on a mouse click and ⌘V/⌘X/⌘Z,
+  so ←, Home, ⌘A, ⌘←, ⌃A/⌃E/⌃K, ⌘⇧Z and every other chord left the buffer describing text that was
+  no longer where the caret was. Any unmodelled key now takes the ghost down immediately and
+  schedules **one** debounced Accessibility re-sync after the key settles — a held ← costs one read,
+  not thirty. `AXSelectedTextChanged` notifications that are not attributable to our own keystroke,
+  our own injection or a suggestion we painted in the last 400 ms do the same, which catches Find,
+  menu commands and apps that move the insertion point programmatically; one that arrives while a
+  generation is actually in the helper is parked and acted on when the request returns, instead of
+  being dropped. A short list of chords known to touch neither the caret nor the text (⌘C, ⌘S, ⌘⇥,
+  ⌘space, ⌘Q/W/M/H, ⌘,, ⌘P, ⌘=/−/0, and the ⌘B/⌘I/⌘U formatting toggles) skips the read entirely.
+- **Editing mid-text gives you a suggestion again.** The re-sync deliberately waits for a typing
+  pause, and when it finally ran it cancelled the generation, cleared the ghost and scheduled
+  nothing — so after *any* caret move there was no suggestion at the first pause, which is most of
+  what editing an existing sentence consists of. A re-sync the user has already typed past is now a
+  reconciliation rather than an invalidation: the typing that followed the arrow key re-established
+  where the caret is, so a suggestion built on it stays up (the host's own text is checked against
+  what we watched being typed, and the full teardown still happens if they disagree), and a
+  completion is generated once the buffer is correct. Until it is, only the characters typed since
+  the caret moved are used as prompt context — never those glued onto text from the old position.
+- **A re-sync no longer wipes the buffer in the apps that need it most.** "Accessibility answered
+  with nothing" and "Accessibility could not answer" were the same branch, and both threw the whole
+  buffer away. In a terminal or an Electron shell with no exposed text — exactly where the keystroke
+  buffer *is* the prompt — every arrow key therefore discarded it 150 ms later. The keystrokes since
+  the caret moved are kept (they are known-good text immediately before the caret); only the part we
+  genuinely no longer know about is dropped.
+- **⌥ is a text modifier, not a command modifier.** It was lumped in with ⌘ and ⌃, so every é, –, —,
+  … and " " reached the document but never the buffer, and the prompt silently disagreed with what
+  was on screen.
+- **Deletes that aren't one character.** ⌫ removed exactly one character from the buffer even for
+  ⌥⌫ (a word), ⌘⌫ (a line) or ⌫ over a selection, and it was handled *before* the modifier check so
+  the modifier never mattered. Those now go down the re-sync path; forward-delete removes the
+  character *after* the caret, so it no longer appends U+007F; keypad Enter takes the Return path
+  and keypad Clear the Esc path.
+- **Auto-repeat is read at last.** A held key's `.keyboardEventAutorepeat` flag was never looked at,
+  so a leaned-on letter entered the vocabulary as "wwwww". Repeats still reach the buffer — a held
+  key really does type — but are excluded from the lexicon, and repeated navigation keys collapse
+  into the single debounced re-sync.
+- **typer no longer learns from itself.** Accepting a suggestion appended the **model's** text to
+  the buffer without advancing the learning watermark, so the next flush taught the lexicon and the
+  style memory typer's own output as the user's vocabulary and voice — and lexicon words get a
+  logit boost on every later generation, a closed loop. Inserted text is now tracked as an
+  unlearnable span: the lexicon skips it, and the style memory records only the runs of genuinely
+  user-written text around it. If the buffer is ever rewritten by a path that doesn't keep this
+  bookkeeping, nothing is learned at all rather than guessed at.
+- **…and it no longer learns from other people.** A caret re-sync fills the buffer with up to 500
+  characters of whatever the host app has in the field — a received email, a shared document, a page
+  of someone else's prose — and the style memory had no watermark, so it re-recorded the *whole*
+  buffer on every flush. Every arrow key and every click could therefore file a stranger's writing
+  in `style.txt` as the user's voice. Re-synced text is now marked unlearnable in its own right and
+  excluded from the style memory as well as the vocabulary, and the style memory has the same
+  per-app watermark the lexicon has, so a paragraph is offered once rather than on every flush.
+  "Reset all data" clears that bookkeeping too: it used to leave the span records behind with the
+  buffers gone, which made every later flush unattributable and silently switched learning off for
+  good.
+- **Personalization strength 0 now means off.** The code comment said strength 0 yielded an empty
+  list; it actually sent 48 words, and the shipped strength of 0.35 sent 54 words at a **+1.2 logit**
+  boost. Under the helper's greedy decoding that is not the "gentle tie-break" the design calls for
+  — a boost that size simply overrides the model's own ranking. The slider now scales how many of
+  your words are sent and how much style sample rides along; the per-word boost is fixed at the
+  evaluated **+0.5** ceiling (the helper's own default, `PersonalizationBias.maxBoost`, and the
+  figure `docs/autocomplete-model.md` documents), and strength 0 sends nothing at all.
+- **Suggestions that can't be shown, aren't.** A suggestion carrying a control or private-use scalar
+  is dropped outright, and the text-after-the-caret echo guard now works in Accessibility-hostile
+  apps too (it was silently inert wherever the keystroke buffer beat AX for the prompt).
+- **Esc means stop.** Dismissing a suggestion now also cancels the generation behind it. A request
+  already in the helper used to land a fifth of a second later and put the dismissed text straight
+  back on screen — with its outcome recorded a second time, against a suggestion the user had
+  already said no to. A dismissed suggestion is also remembered, so it is not re-shown while the
+  context is unchanged: greedy decoding regenerates it character for character. That covers Esc, and
+  typing past a suggestion and then backspacing back to where it was shown. It deliberately does
+  *not* keep suppressing anything once you have typed on — by then the context has moved and the
+  next suggestion is genuinely a different one. The match tolerates a prefix either way, because a
+  suggestion dismissed mid-stream is only the part that had arrived.
+- **Training rows record the context the model actually saw.** They logged the raw keystroke buffer
+  even when the generation had been built from Accessibility text, so a large share of the corpus
+  paired a suggestion with a context that never produced it. The schema version is read from
+  `TrainingLog.schemaVersion` instead of a literal at each write site.
+
+### The helper stopped eating its own escape codes
+
+`scripts/llama_server.cpp`'s string logic now lives in `scripts/llama_server_text.h`, free of
+llama.cpp, so it can be compiled and tested with clang++ alone (`scripts/run_helper_tests.sh`).
+
+- **The JSON unescaper was incomplete.** It understood `\n \t \r \" \\` and fell through to a raw
+  copy for everything else — but Swift's `JSONEncoder` escapes every C0 control as `\u001c` and `/`
+  as `\/`, so a stray arrow key in the context reached the model as the **literal ASCII text**
+  `u001c`, and greedy decoding continued it forever. The whole grammar is implemented now,
+  `\uXXXX` and surrogate pairs included, with malformed input dropped rather than substituted.
+- **A scalar screen on both sides of the model.** Control, C1, private-use and U+FFFD scalars and
+  invalid UTF-8 are stripped from the prompt and, mid-stream, end the generation rather than flash
+  in the ghost text. A truncated multi-byte character at the token budget is trimmed first, so a
+  split emoji isn't mistaken for the model misbehaving.
+- **A loop detector that survives space-free garbage.** The old repeated-word check was
+  space-delimited and structurally could not see `u001cu001cu001c…`, which is one "word". The new
+  one catches a 2–8 byte unit repeated back to back — four times over nine bytes for a short unit,
+  three times over twelve for a longer one — while leaving "banana", "Mississippi", "hahaha",
+  "$1,000,000,000" and runs of repeated emoji alone. URLs, paths and hex dumps repeat short units
+  for structural reasons and are exempted, but narrowly: the structure has to be inside the repeated
+  unit itself (one `/` anywhere in a space-free string used to switch the detector off for all of
+  it, so `foo/loooploooploooploop` sailed through), a hex exemption needs the repeated run to be hex
+  digits inside an `0x…` token, and six identical repetitions are never exempt whatever they are
+  made of.
+
+### Stores that validate, and a one-time repair of the ones that didn't
+
+- **Every write path is gated (`TextSanitizer.swift` new).** One shared scalar policy decides what
+  may be learned from, persisted or sent to the model: everything passes except C0/C1 controls
+  (bar tab/newline/CR), private use, U+FFFD and noncharacters. Invisible *formatting* — U+FEFF and
+  the rest of the Cf category, minus the two ranges that hold real emoji together (the zero-width
+  joiner, and the tag block a subdivision flag like 🏴󠁧󠁢󠁥󠁮󠁧󠁿 is built from) — is **stripped** rather
+  than used as grounds to throw a row away: it arrives from applications' Accessibility text, not
+  from a keyboard, and on the real corpus 897 of 14,503 training rows and 17 style lines contained
+  nothing disallowed except invisibles. Dropping them would have cost 6% of the corpus to delete
+  characters nobody can see.
+- **A one-time migration repairs what is already on disk (`StoreMigration.swift` new).** It runs
+  once, at launch, before any store is read. Every file is **backed up first** (never overwriting an
+  existing backup) and rewritten through a sibling temp file, 0600 preserved; a store that needs no
+  edits is neither backed up nor rewritten; the done-marker is only stamped once every store
+  succeeded, so a partial run retries on the next launch instead of being silently skipped. On the
+  author's own data: 420 training rows dropped and 897 repaired, 5 style lines dropped and 17
+  repaired, 55 lexicon entries dropped. Rows that need no repair are written back byte-identical.
+- **`feedback.json` and `router.json` are reset, not repaired.** They hold no text — they hold a
+  verdict built from arrow keys counted as rejections, and there is no way to tell a real rejection
+  from a cursor move after the fact. Both are backed up and removed; both loaders treat a missing
+  file as "no history", which is exactly the state we want. They re-learn within a few hundred
+  suggestions.
+- **The log rotates (`Logging.swift`).** It was append-only and had reached 16 MB in the field. It
+  now rotates at 8 MB, keeping one previous generation so a crash report still has the run before
+  last — at most ~16 MB on disk, ever. Writes go through a single long-lived handle on a serial
+  queue instead of an open/seek/write/close per call, several of which ran per keystroke.
+- **Two more headless test suites.** `scripts/run_input_tests.sh` (214 checks) covers the keycode
+  table with every modifier combination, the harmless-chord list, the rejected-suggestion match and
+  the unlearnable-span bookkeeping; `scripts/run_store_tests.sh` (268 checks) covers the scalar
+  policy, the word shape, `TrainingLog`'s write gate and streaming roll, and the migration end to
+  end — including a run against a copy of a real store directory that reports counts only, never
+  contents.
+
+## One caret probe, no more massive text, and a ghost that hides instead of guessing
+
+An investigation into "the ghost is in the wrong place" found 1,982 wrong-place fallbacks in a
+single session: the caret pipeline could not fail. Every tier ended in a hardcoded point that the
+overlay then clamped onto the main screen, so a failed probe always produced a confident placement
+somewhere. That is gone. Placement is now one probe returning one value — or nothing, in which case
+the ghost hides and the suggestion waits for a real fix.
+
+- **One probe, one value (`CaretGeometry.swift` new, `TyperApp+Caret.swift`).** A single
+  `resolveCaret()` returns a `CaretFix` (caret point, line height, font, colour, screen, element
+  frame, which tier produced it) or `nil` — and `nil` means *do not show*. Everything downstream
+  (ghost font, panel height, `ghostWidth`'s measuring font, the screenshot capture clip) reads that
+  struct instead of going back to Accessibility, which took a placement from 10–50+ synchronous AX
+  round-trips to about five. The `(400, 400)` last-resort point, the focused-element-frame tier and
+  the clamp-onto-`NSScreen.main` rescue are all deleted.
+- **No more massive text.** The ghost font is now bounded by the *measured* caret line, not by
+  whatever point size the host's attributed string claims: an AX font is only believed when its own
+  line box matches the line we measured, the final size can never exceed 1.35x the line, and the
+  font cache is keyed by the **focused element** with a 30s TTL instead of by bundle id. Clicking a
+  Notion H1 used to hand back a 48pt font that was then cached for the whole session and applied to
+  every field in the app.
+- **Garbage rects are rejected in AX space, before the flip.** The classic bogus AX answer is
+  `(0, 0, w, h)`; the old guard ran *after* the top-left→bottom-left flip, by which point it looked
+  like an ordinary rect near the top of the primary display — which is exactly where the ghost kept
+  landing. Validation now runs pre-flip and also checks the rect against the focused element's own
+  frame, a plausible line-height window (absolute, and relative to this element's known line), a
+  per-probe width cap (a 300pt "caret" is a selection), and requires the flipped rect to sit wholly
+  inside exactly one display. The width caps are relative to the rect's own height, which is only
+  safe while the element frame is there to bound it — so when the frame is unknown they fall back to
+  strict absolute ceilings, and the whole-line tier (whose cap is deliberately unbounded, and whose
+  commonest wrong answer is "the entire text view") is not admissible without a frame at all.
+- **A real ladder, and Chromium/Electron finally answer it.** Browsers and Electron shells get
+  `AXManualAccessibility` set once per process — without it Chrome, Slack, Discord, VS Code and
+  Notion expose no text geometry at all — and are probed marker-first; everything else is probed
+  bounds-first. `AXBoundsForRange` is now at most three probes (collapsed caret → previous glyph's
+  right edge → next glyph's left edge); the 40-step backward scan, which could fire 40 synchronous
+  round-trips on the main thread, is gone. A non-collapsed selection is probed at its collapsed end
+  instead of returning the selection rectangle. A new `AXInsertionPointLineNumber` /
+  `AXRangeForLine` tier covers line ends and empty lines.
+- **The ghost stays on the right monitor (`SuggestionOverlay.swift`, `GhostView.swift`).** The
+  screen is chosen by the caret *point*, never by intersecting the up-to-760pt-wide ghost frame and
+  never `NSScreen.main`; no screen owns the point means nothing is drawn. A ghost too wide for the
+  room left is truncated rather than shifted left over the text you are typing, and the layer's
+  contents scale now follows the display it lands on instead of being fixed at construction.
+- **Staleness has a budget.** Typing through a suggestion extrapolates the cached caret forward for
+  at most 600ms / 40 characters / zero line changes; past that the ghost hides until a fresh fix
+  lands. The click anchor gets 20s / 80 characters and is dropped once the extrapolated advance
+  approaches the field's right edge (soft wrap). Caret state is invalidated on focused-element
+  change, app switch, scroll, mouse-down, **window move/resize**, **display-layout change** and
+  **Space change** — the last three are new, and all of them previously left the ghost pinned to
+  stale pixels.
+- **Snappier.** All re-anchor requests (AX notifications, the 90/280ms timers, scroll, streaming
+  partials) coalesce to at most one probe per ~16ms tick; the caret probe runs on a 25ms AX
+  messaging budget (the rest of the app keeps 50ms); an app whose AX wedges twice in a row is put on
+  the cheap tiers for 10 seconds; the window's web host is read once per focus session and only for
+  browsers (it used to run five AX reads plus a freshly compiled `NSDataDetector` on *every*
+  placement, in every app); and the display flip pivot is cached instead of re-enumerating screens.
+- **A headless test suite (`scripts/caret_tests.swift`, `scripts/run_caret_tests.sh`).** The
+  placement rules are pure functions of their arguments — screens and the flip pivot are passed in —
+  so 180 table-driven checks cover the flip on negative-origin/above/below displays, every rejection
+  case, the font clamp, multi-monitor screen selection, ghost clamping and the staleness budgets,
+  with no window server or Accessibility grant required.
+
 ## Click-anchored caret in Electron/web, ~10x cheaper screenshots, no more phantom percentages
 
 Three things that made suggestions feel off in non-native apps are fixed: the ghost now lines up

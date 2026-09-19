@@ -241,40 +241,30 @@ final class ModelRouter {
     }
 
     // Wipe the race state (share + reward windows + any lock) — also called by "Reset All Data".
-    // Also drops the derived personalization bias cache: "Reset All Data" clears the lexicon it
-    // is built from, so the cached map/string must rebuild from the now-empty vocabulary. No
-    // separate state file to remove — the bias map is derived in-memory from lexicon.json.
+    // Also drops the derived personalization cache: "Reset All Data" clears the lexicon it is
+    // built from, so the cached word list must rebuild from the now-empty vocabulary. No
+    // separate state file to remove — it is derived in-memory from lexicon.json.
     func reset() { mem.reset(); personalization.invalidate() }
 
     // Kill both arms' helper processes — called before swapping the router on a model switch.
     func shutdown() { clientA.stop(); clientB?.stop() }
 
-    // MARK: - Personalization logit-bias (#10, Wave 4 interim — NO LoRA)
+    // MARK: - Personalization (#10, Wave 4 interim — NO LoRA)
     //
-    // The personalization seam, owned in one place. From the user's high-frequency words
-    // (PersonalLexicon) we derive BOTH:
-    //   1. `lexiconString(...)` — the strength-scaled, frequency-ordered word list that the
-    //      EXISTING request path already carries (`LlamaClient.request(lexicon:)`); the helper
-    //      tokenizes it and biases the sampler toward those words. This is the live mechanism.
-    //   2. `personalizationBias(...)` — the `[token:Float]` logit-bias map the spec calls for:
-    //      each kept word's first token mapped to a strength-scaled boost (front-loaded by
-    //      frequency rank). This is the in-process artifact a future weighted wire consumes
-    //      directly; it is derived from real token ids via the helper's tokenize endpoint
-    //      (`ids:1`) through the injected tokenizer, never a Swift-side guess.
+    // The personalization seam, owned in one place: from the user's high-frequency words
+    // (PersonalLexicon) we derive the strength-scaled, frequency-ordered word list that the
+    // request path already carries (`LlamaClient.request(lexicon:)`). The helper tokenizes it
+    // and applies a flat per-word first-token boost (`PersonalizationBias.maxBoost`).
     //
-    // Both are OFF (empty) when `strength == 0` — today's default — so personalization adds
-    // nothing until the user opts in, and both re-derive whenever the strength bucket or the
-    // underlying word list changes (cached otherwise; this runs on the generation hot path).
+    // There used to be a second, parallel artifact here — a Swift-side `[token: Float]` bias
+    // map built through an injected tokenizer. It had no caller, and the tokenizer was never
+    // injectable (the closure that fed it hard-returned `[]`), so it computed an empty map
+    // nobody read. It is gone; the lexicon string is, and always was, the live mechanism.
+    //
+    // OFF (empty) when `strength == 0` — today's default — so personalization adds nothing
+    // until the user opts in, and it re-derives whenever the strength bucket or the underlying
+    // word list changes (cached otherwise; this runs on the generation hot path).
     private let personalization = PersonalizationBias()
-
-    // A tokenizer the bias builder uses to map a word to its leading token id. Injected from
-    // the app (it wraps the helper's tokenize/`ids` endpoint). Until set, `personalizationBias`
-    // yields an empty map and only the lexicon-string path is active — the helper still applies
-    // its own per-word bias from the string, so personalization is never silently dead.
-    func setBiasTokenizer(_ tok: @escaping (String) -> [Int32]) {
-        guard personalization.tokenizer == nil else { return }   // idempotent: wire once
-        personalization.tokenizer = tok
-    }
 
     // The strength-scaled lexicon word list for the live request path. `strength` is read at
     // call time (not from the init-time cfg copy) so a slider change takes effect immediately.
@@ -282,16 +272,6 @@ final class ModelRouter {
     func lexiconString(words: String, strength: Double) -> String {
         personalization.lexiconString(words: words, strength: strength)
     }
-
-    // The `[token:Float]` logit-bias map (spec G.3 interim). Re-derived on strength/word change;
-    // empty when strength == 0 or no tokenizer is wired yet.
-    func personalizationBias(words: String, strength: Double) -> [Int32: Float] {
-        personalization.biasMap(words: words, strength: strength)
-    }
-
-    // Drop the derived bias state — strength changed enough that the cache must rebuild, or the
-    // lexicon was wiped by "Reset All Data".
-    func resetPersonalization() { personalization.invalidate() }
 
     // Synchronously persist race state — called on app terminate so a winner locked
     // in the last debounce window isn't lost on quit.
@@ -480,39 +460,34 @@ final class RouterMemory {
     }
 }
 
-// Personalization logit-bias builder (spec §G.3 interim — NO LoRA). Turns the user's
-// high-frequency words into (a) the strength-scaled lexicon string the live request path
-// already carries and (b) the `[token:Float]` logit-bias map the spec specifies. Both are
-// derived from the SAME word list and the SAME strength so the two channels never disagree.
+// Personalization word-list builder (spec §G.3 interim — NO LoRA). Turns the user's
+// high-frequency words into the strength-scaled lexicon string the live request path already
+// carries; the HELPER tokenizes it and applies the per-word first-token boost.
 //
-// Strength (0..1) shapes personalization on two axes:
-//   • breadth — how many of the user's words ride along (baseline 48 → cap 64 at full
-//     strength), matching the prior `personalizedLexicon()` behavior so strength 0 is a
-//     no-op and not a regression;
-//   • depth   — the per-token logit boost. Each kept word is front-loaded by its frequency
-//     rank (the most-typed words bias hardest) and the whole curve is scaled by strength, so
-//     a low slider nudges and a high slider leans.
+// There was a second channel here — a Swift-side `[token: Float]` map built through an
+// injected tokenizer. Nothing ever called it and the tokenizer was never injectable, so it
+// computed an empty map nobody read; it has been removed rather than left to look live.
+//
+// Strength (0..1) shapes personalization on one axis, breadth: how many of the user's words
+// ride along (baseline 48 → cap 64 at full strength), matching the prior
+// `personalizedLexicon()` behavior so strength 0 is a no-op and not a regression. Depth (the
+// per-word boost) is deliberately NOT on the slider — see `maxBoost`.
 //
 // All state is main-thread-confined (it lives on the generation hot path, same as the rest of
-// the router) and memoized on `(strengthBucket, words)`: tokenization only re-runs when the
-// user moves the slider or their top-word list actually changes.
+// the router) and memoized on `(strengthBucket, words)`, so it only re-runs when the user
+// moves the slider or their top-word list actually changes.
 final class PersonalizationBias {
-    // Helper-backed tokenizer: word → its token ids (leading-space form). Returns [] until the
-    // app wires it; the bias map stays empty in that window (the lexicon-string channel still
-    // works, so personalization is degraded, never dead).
-    var tokenizer: ((String) -> [Int32])?
-
-    // Gentle by design: at full strength a frequent word's first token gets at most this boost
-    // (matching the helper's historical +0.5 flat bias ceiling), tapering toward the tail of the
-    // list. Far too small to force a word the model wouldn't otherwise consider — it breaks ties
+    // Gentle by design: a word on the list gets at most this first-token boost in the helper.
+    // Far too small to force a word the model wouldn't otherwise consider — it breaks ties
     // toward the user's vocabulary and nothing more.
-    private static let maxBoost: Float = 0.5
+    // Read by the app's `personalizedLexiconBias()`, which is what puts it on the wire, so the
+    // documented ceiling and the value actually sent can never drift apart.
+    static let maxBoost: Float = 0.5
     private static let baseWords = 48
     private static let maxWords = 64
 
     private var cacheKey = ""              // "<bucket>|<words>" the cache was built for
     private var cachedString = ""
-    private var cachedMap: [Int32: Float] = [:]
 
     // Bucket strength to one decimal so micro-jitter on a continuous slider doesn't thrash the
     // tokenizer; the visible effect is identical and the cache stays warm.
@@ -521,11 +496,14 @@ final class PersonalizationBias {
         return "\(bucket)|\(words)"
     }
 
-    // Frequency-ordered word slice for the given strength: the established baseline (48) at
-    // strength 0 — preserving today's lexicon behavior, NOT a regression — growing toward the
-    // 64-word cap as strength rises. The caller has already gated on `lexiconEnabled`.
+    // Frequency-ordered word slice for the given strength. Strength 0 is OFF and returns
+    // nothing: it used to return the full 48-word baseline, which meant the slider's zero
+    // position still shipped every one of the user's words to the sampler. The count grows
+    // from the 48-word baseline at the first non-zero strength toward the 64-word cap at
+    // full strength. The caller has already gated on `lexiconEnabled`.
     private func scaledWords(_ words: String, _ strength: Double) -> [String] {
         let s = min(1, max(0, strength))
+        guard s > 0 else { return [] }
         let n = Self.baseWords + Int((Double(Self.maxWords - Self.baseWords) * s).rounded())
         return words.split(separator: " ").prefix(n).map(String.init)
     }
@@ -537,36 +515,11 @@ final class PersonalizationBias {
         return cachedString
     }
 
-    func biasMap(words: String, strength: Double) -> [Int32: Float] {
-        rebuildIfNeeded(words: words, strength: strength)
-        return cachedMap
-    }
-
     private func rebuildIfNeeded(words: String, strength: Double) {
         let k = key(words, strength)
         if k == cacheKey { return }
         cacheKey = k
-        let kept = scaledWords(words, strength)
-        cachedString = kept.joined(separator: " ")
-        cachedMap = [:]
-        // The bias MAP is OFF at strength 0 (spec §G.3) even though the lexicon string stays at
-        // its baseline — strength 0 is neutral sampling, no per-token boost.
-        let s = Float(min(1, max(0, strength)))
-        guard s > 0, !kept.isEmpty, let tok = tokenizer else { return }
-        let count = kept.count
-        // Map each word's FIRST token (as a word-start, leading space) to a strength-scaled,
-        // rank-tapered boost. Dedup on token id keeping the strongest (most-frequent) weight so
-        // two words sharing a leading token don't double-count.
-        for (i, w) in kept.enumerated() {
-            let ids = tok(" " + w)
-            guard let first = ids.first else { continue }
-            // Linear taper from 1.0 (rank 0) down to ~0.4 (last rank): the head of the list bites
-            // hardest. Scaled by strength so the whole curve collapses to 0 as the slider drops.
-            let rankWeight = 1.0 - 0.6 * (Float(i) / Float(max(1, count - 1)))
-            let boost = Self.maxBoost * s * rankWeight
-            if let existing = cachedMap[first] { cachedMap[first] = max(existing, boost) }
-            else { cachedMap[first] = boost }
-        }
+        cachedString = scaledWords(words, strength).joined(separator: " ")
     }
 
     // Force a rebuild on the next query (slider moved past the cache bucket, or lexicon reset).

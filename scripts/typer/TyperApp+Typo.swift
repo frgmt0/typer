@@ -168,11 +168,17 @@ extension TyperApp {
 
     // Present any pending correction inline at the caret line, same as completions.
     func present(_ c: Correction) {
+        // No caret fix means we'd have to guess where the diff belongs. A correction has
+        // no re-place path (unlike a completion, which reappears on the next fix), so
+        // rather than draw it in the wrong place we don't arm it at all.
+        guard let fix = resolveCaret(forceFresh: true) else {
+            dlog("[\(activeAppKey)] \(c.kind) '\(c.displayOriginal)' suppressed — no caret fix")
+            return
+        }
         active = c
         stats.shown += 1; statsTouched()
-        let point = currentCaretPoint()
-        overlay.show(correction: c, at: point, lineHeight: lastCaretHeight)
-        dlog("[\(activeAppKey)] \(c.kind) '\(c.displayOriginal)' -> '\(c.replacement ?? c.message ?? "")' at=\(point)")
+        overlay.show(correction: c, at: fix)
+        dlog("[\(activeAppKey)] \(c.kind) '\(c.displayOriginal)' -> '\(c.replacement ?? c.message ?? "")' at=\(fix.pointAppKit)")
     }
 
     // Apply a correction in place. Prefers AX (exact range, preserves the trailing
@@ -189,10 +195,11 @@ extension TyperApp {
         if let r = resolved {
             // Electron/WebKit contenteditables often claim AX selection writes worked
             // but then insert at the live caret instead of replacing the selected word
-            // (e.g. "this" -> "ththeis"). If the element has TextMarker caret APIs,
-            // use AX only to put the caret at the known end position, then do the
-            // keystroke deletion/paste path that those editors actually honor.
-            let webLike = textMarkerCaretRect(element: r.element) != nil
+            // (e.g. "this" -> "ththeis"). For those shells, use AX only to put the caret
+            // at the known end position, then do the keystroke deletion/paste path that
+            // they actually honor. (This used to probe TextMarker bounds per apply; the
+            // frontmost app's kind is now classified once and cached.)
+            let webLike = isWebContentElement(r.element)
             if !webLike,
                setAXText(element: r.element, range: r.range, text: text, trailing: r.trailing, original: original) {
                 replaceLastWordInBuffer(original: original, with: text)
@@ -565,7 +572,7 @@ extension TyperApp {
         // Prefer an exact AX range replace; fall back to keystrokes. The token has no trailing
         // separator, so trailing = 0.
         if let r = emojiTokenRangeViaAX(token: token) {
-            let webLike = textMarkerCaretRect(element: r.element) != nil
+            let webLike = isWebContentElement(r.element)
             if !webLike, setAXText(element: r.element, range: r.range, text: emoji, trailing: 0, original: token) {
                 replaceTokenInBuffer(token: token, with: emoji)
                 log("emoji expanded via AX '\(token)' -> \(emoji)")
